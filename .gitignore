@@ -1,0 +1,18 @@
+# ---- secrets & personal data (never publish) ----
+SECRETS.local.md
+WORK-PC-SETUP.md
+collector/collector.config.json
+.dev.vars
+.dev.vars.*
+
+# personal usage data & generated reports
+data/
+work-extract/
+combined-stats.json
+dashboard.html
+*.zip
+
+# logs / build / deps
+*.log
+node_modules/
+.wrangler/

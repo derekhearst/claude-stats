@@ -1,0 +1,159 @@
+#!/usr/bin/env bun
+/**
+ * Claude usage collector — runs on each PC, parses local Claude Code transcripts
+ * (and optionally a claude.ai web export), and POSTs a full snapshot to the
+ * dashboard Worker's /ingest endpoint. Idempotent: safe to run on a schedule.
+ *
+ * Config: collector.config.json next to this file:
+ *   { "source": "work", "url": "https://claude-usage-stats.<sub>.workers.dev",
+ *     "token": "<INGEST_TOKEN>" }
+ *
+ * Usage:
+ *   bun collect.mjs                          # Claude Code transcripts → source from config
+ *   bun collect.mjs --source home            # override source
+ *   bun collect.mjs --web path/to/conversations.json   # claude.ai export → source "web"
+ *
+ * Works under bun or Node 18+ (uses global fetch; no dependencies).
+ */
+
+import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { join, dirname } from "node:path";
+import { homedir } from "node:os";
+import { fileURLToPath } from "node:url";
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+// ---- args + config ------------------------------------------------------
+const argv = process.argv.slice(2);
+const getArg = (k) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : undefined; };
+
+let cfg = {};
+const cfgPath = join(HERE, "collector.config.json");
+if (existsSync(cfgPath)) cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+
+const webPath = getArg("--web");
+const source = getArg("--source") || (webPath ? "web" : cfg.source);
+const url = (getArg("--url") || cfg.url || "").replace(/\/+$/, "");
+const token = getArg("--token") || cfg.token;
+const claudeDir = getArg("--claude-dir") || cfg.claudeDir || join(homedir(), ".claude");
+
+if (!source || !url || !token) {
+  console.error("Need source, url, and token (via collector.config.json or flags). See header.");
+  process.exit(1);
+}
+
+// ---- helpers ------------------------------------------------------------
+const localDate = (ts) => {
+  const d = new Date(ts);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+};
+function walk(dir, out = []) {
+  if (!existsSync(dir)) return out;
+  for (const name of readdirSync(dir)) {
+    const p = join(dir, name);
+    const s = statSync(p);
+    if (s.isDirectory()) walk(p, out);
+    else if (name.endsWith(".jsonl")) out.push(p);
+  }
+  return out;
+}
+
+// ---- build the snapshot -------------------------------------------------
+let payload;
+if (webPath) payload = fromWebExport(webPath, source);
+else payload = fromTranscripts(claudeDir, source);
+
+// ---- send ---------------------------------------------------------------
+const res = await fetch(url + "/ingest", {
+  method: "POST",
+  headers: { "content-type": "application/json", authorization: "Bearer " + token },
+  body: JSON.stringify(payload),
+});
+const text = await res.text();
+if (!res.ok) { console.error(`Ingest failed (${res.status}): ${text}`); process.exit(1); }
+console.log(`Pushed ${source}: ${payload.daily.length} days, ${payload.modelUsage.length} models → ${text}`);
+
+// ---- parsers ------------------------------------------------------------
+function fromTranscripts(dir, source) {
+  const files = walk(join(dir, "projects"));
+  const daily = {};            // date -> {messages,sessions,tool_calls}
+  const dmt = {};              // date -> model -> tokens(in+out)
+  const usage = {};            // model -> {input,output,cacheRead,cacheCreate}
+  const sessionStart = {};     // sid -> date (first seen)
+  let firstSession = null;
+
+  for (const fp of files) {
+    let lines;
+    try { lines = readFileSync(fp, "utf8").split("\n"); } catch { continue; }
+    for (const line of lines) {
+      const t = line.trim(); if (!t) continue;
+      let d; try { d = JSON.parse(t); } catch { continue; }
+      if (d.type !== "user" && d.type !== "assistant") continue;
+      const ts = d.timestamp; if (!ts) continue;
+      const date = localDate(ts);
+      const sid = d.sessionId;
+
+      (daily[date] ??= { messages: 0, sessions: 0, tool_calls: 0 }).messages++;
+      if (sid && !(sid in sessionStart)) sessionStart[sid] = date;
+      if (!firstSession || ts < firstSession) firstSession = ts;
+
+      if (d.type === "assistant") {
+        const msg = d.message || {};
+        const model = msg.model, u = msg.usage;
+        if (model && u) {
+          const io = (u.input_tokens || 0) + (u.output_tokens || 0);
+          (dmt[date] ??= {});
+          dmt[date][model] = (dmt[date][model] || 0) + io;
+          const mu = (usage[model] ??= { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 });
+          mu.input += u.input_tokens || 0;
+          mu.output += u.output_tokens || 0;
+          mu.cacheRead += u.cache_read_input_tokens || 0;
+          mu.cacheCreate += u.cache_creation_input_tokens || 0;
+        }
+        const c = msg.content;
+        if (Array.isArray(c))
+          daily[date].tool_calls += c.filter(b => b && b.type === "tool_use").length;
+      }
+    }
+  }
+  for (const [sid, date] of Object.entries(sessionStart)) daily[date].sessions++;
+
+  return {
+    source, firstSession,
+    daily: Object.entries(daily).map(([date, v]) => ({ date, ...v })),
+    dailyModelTokens: Object.entries(dmt).flatMap(([date, mm]) =>
+      Object.entries(mm).filter(([, t]) => t > 0).map(([model, tokens]) => ({ date, model, tokens }))),
+    modelUsage: Object.entries(usage).map(([model, u]) => ({ model, ...u })),
+  };
+}
+
+function fromWebExport(path, source) {
+  const raw = JSON.parse(readFileSync(path, "utf8"));
+  const convos = Array.isArray(raw) ? raw : (raw.conversations || []);
+  const daily = {};
+  let firstSession = null;
+
+  for (const c of convos) {
+    const cStart = c.created_at || c.create_time || c.created;
+    if (cStart) {
+      const d = localDate(cStart);
+      (daily[d] ??= { messages: 0, sessions: 0, tool_calls: 0 }).sessions++;
+      if (!firstSession || new Date(cStart).toISOString() < firstSession)
+        firstSession = new Date(cStart).toISOString();
+    }
+    const msgs = c.chat_messages || c.messages || [];
+    for (const m of msgs) {
+      const ts = m.created_at || m.create_time || cStart;
+      if (!ts) continue;
+      const d = localDate(ts);
+      (daily[d] ??= { messages: 0, sessions: 0, tool_calls: 0 }).messages++;
+    }
+  }
+  // web export has no token usage
+  return {
+    source, firstSession,
+    daily: Object.entries(daily).map(([date, v]) => ({ date, ...v })),
+    dailyModelTokens: [],
+    modelUsage: [],
+  };
+}

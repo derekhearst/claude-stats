@@ -1,0 +1,5 @@
+{
+  "source": "home",
+  "url": "https://claude-usage-stats.YOUR-SUBDOMAIN.workers.dev",
+  "token": "PASTE_THE_INGEST_TOKEN_HERE"
+}

@@ -1,0 +1,19 @@
+name = "claude-usage-stats"
+main = "src/index.js"
+compatibility_date = "2026-06-18"
+
+# Custom domain. Requires the zone `derekhearst.com` to be active on the SAME
+# Cloudflare account. `wrangler deploy` will create the DNS record + cert.
+[[routes]]
+pattern = "usage.derekhearst.com"
+custom_domain = true
+
+# D1 database (already created via the Cloudflare API)
+[[d1_databases]]
+binding = "DB"
+database_name = "claude-usage-stats"
+database_id = "c17eecc1-7aef-464d-b771-9339df70fb0c"
+
+# Secrets (set with `wrangler secret put ...`, NOT here):
+#   INGEST_TOKEN  - shared secret the PC collectors use to POST data
+#   DASH_KEY      - the key in the dashboard URL (?key=...) that gates viewing
