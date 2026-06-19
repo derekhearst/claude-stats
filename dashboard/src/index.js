@@ -288,118 +288,153 @@ function render(daily, dmt, mu, meta, hourly = [], toolRows = [], projRows = [])
     return parts.length ? parts[parts.length - 1] : p;
   };
 
-  // heatmap grid
+  // activity heatmap — windowed to the last 53 weeks so a single old web
+  // conversation doesn't stretch it into a huge empty expanse
   const maxMsgs = Math.max(1, ...Object.values(byDate));
-  let heat = "";
+  let heatHtml = "", monthsHtml = "";
   if (dates.length) {
-    let start = new Date(dates[0] + "T00:00:00Z");
     const end = new Date(dates.at(-1) + "T00:00:00Z");
-    start.setUTCDate(start.getUTCDate() - start.getUTCDay());
-    const weeks = [];
+    end.setUTCDate(end.getUTCDate() + (6 - end.getUTCDay()));   // Saturday of latest week
+    const start = new Date(end);
+    start.setUTCDate(start.getUTCDate() - (53 * 7 - 1));        // 53 weeks back, Sunday
+    const wks = [];
     for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
       const iso = d.toISOString().slice(0, 10);
       const wk = Math.floor((d - start) / (7 * 86400000));
-      (weeks[wk] ??= []).push(iso);
+      (wks[wk] ??= []).push(iso);
     }
-    heat = weeks.map(wk => `<div class=col>${wk.map(iso => {
+    heatHtml = wks.map(wk => `<div class=col>${wk.map(iso => {
       const v = byDate[iso] || 0;
       const lvl = v ? Math.min(4, Math.ceil(v / maxMsgs * 4)) : 0;
-      const title = v ? `${iso}: ${fmt(v)} msgs` : `${iso}: none`;
-      return `<div class="d l${lvl}" title="${title}"></div>`;
+      return `<div class="d l${lvl}" title="${v ? `${iso}: ${fmt(v)} msgs` : iso}"></div>`;
     }).join("")}</div>`).join("");
+    const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+    let lastM = -1;
+    monthsHtml = wks.map(wk => {
+      const m = new Date(wk[0] + "T00:00:00Z").getUTCMonth();
+      const lab = m !== lastM ? MON[m] : ""; lastM = m;
+      return `<div class=mlab>${lab}</div>`;
+    }).join("");
   }
 
-  const card = (l, v) => `<div class=card><div class=lbl>${l}</div><div class=val>${v}</div></div>`;
-  const lastPush = meta.map(m => `${m.source}: ${(m.last_push||"").slice(0,16).replace("T"," ")}`).join(" · ");
+  const card = (l, v, cls = "") => `<div class="card ${cls}"><div class=lbl>${l}</div><div class=val>${v}</div></div>`;
+  const lastPush = meta.map(m => `${m.source} ${(m.last_push||"").slice(5,16).replace("T"," ")}`).join(" · ");
+  const est = ' <span class=tag>est</span>';
+  // generic evenly-spaced bar chart (flex:1 columns → consistent spacing)
+  const barChart = (items, labFn, valFn, titleFn) => {
+    const mx = Math.max(1, ...items.map(valFn));
+    return `<div class=chart>${items.map((it, i) => {
+      const h = Math.round(valFn(it) / mx * 100);
+      return `<div class=bcol title="${titleFn(it, i)}"><div class=bar style="height:${h}px"></div><div class=blab>${labFn(it, i)}</div></div>`;
+    }).join("")}</div>`;
+  };
 
-  return `<!doctype html><meta charset=utf-8>
+  return `<!doctype html><html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Claude usage</title>
 <style>
- body{background:#161616;color:#e8e8e8;font:14px/1.45 system-ui,sans-serif;margin:0;padding:24px}
- h1{font-size:19px;margin:0 0 2px}.sub{color:#888;font-size:12px;margin-bottom:20px}
- .grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;max-width:880px}
- .card{background:#222;border:1px solid #333;border-radius:8px;padding:13px 15px}
- .lbl{color:#999;font-size:12px;margin-bottom:5px}.val{font-size:19px;font-weight:600}
- .heat{display:flex;gap:3px;margin:26px 0 6px;overflow-x:auto;padding-bottom:6px}
+ *{box-sizing:border-box}
+ body{background:#0f0f11;color:#e6e6e8;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;padding:28px 22px}
+ .wrap{max-width:1080px;margin:0 auto}
+ header{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:10px;margin-bottom:20px}
+ h1{font-size:20px;font-weight:650;margin:0;letter-spacing:-.01em}
+ .meta{color:#73737b;font-size:12px;margin-top:3px}
+ a.logout{color:#8a8a90;font-size:12px;text-decoration:none;border:1px solid #2a2a2e;padding:5px 11px;border-radius:7px}
+ a.logout:hover{color:#ddd;border-color:#3a3a40}
+ .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
+ .card{background:#1a1a1d;border:1px solid #27272b;border-radius:12px;padding:14px 16px}
+ .card.accent{background:linear-gradient(140deg,#1c2a44,#1a1a1d);border-color:#31486b}
+ .lbl{color:#83838a;font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
+ .val{font-size:22px;font-weight:650;letter-spacing:-.01em}
+ .tag{font-size:10px;color:#73737b;font-weight:500;vertical-align:middle}
+ .row{display:grid;gap:14px;margin-top:14px}
+ .charts{grid-template-columns:repeat(auto-fit,minmax(290px,1fr))}
+ .tables{grid-template-columns:repeat(auto-fit,minmax(330px,1fr))}
+ .panel{background:#1a1a1d;border:1px solid #27272b;border-radius:12px;padding:16px 18px}
+ h2{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#9a9aa2;margin:0 0 12px}
+ .chart{display:flex;align-items:flex-end;gap:4px;height:124px}
+ .bcol{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
+ .bar{width:72%;max-width:24px;background:#3b6fb0;border-radius:3px 3px 0 0;min-height:2px}
+ .bcol:hover .bar{background:#6ba3f0}
+ .blab{color:#73737b;font-size:10px;margin-top:6px;white-space:nowrap;height:12px}
+ .heatwrap{overflow-x:auto;padding-bottom:2px}
+ .months{display:flex;height:14px}
+ .mlab{width:15px;flex:none;font-size:10px;color:#73737b}
+ .heat{display:flex;gap:3px}
  .col{display:flex;flex-direction:column;gap:3px}
- .d{width:12px;height:12px;border-radius:2px;background:#262626}
+ .d{width:12px;height:12px;border-radius:3px;background:#1f1f23}
  .l1{background:#1e3a5f}.l2{background:#2f5b94}.l3{background:#4a83cf}.l4{background:#6ba3f0}
- .legend{color:#888;font-size:11px;display:flex;gap:4px;align-items:center}
- table{border-collapse:collapse;margin-top:22px;font-size:13px}
- td,th{padding:5px 16px 5px 0;text-align:left}th{color:#999;font-weight:500}
- h2{font-size:14px;color:#bbb;margin:26px 0 0}
- .big{font-size:23px;font-weight:700}
- .dow{display:flex;gap:8px;align-items:flex-end;height:80px;margin-top:10px}
- .dowcol{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;width:30px}
- .dowbar{width:18px;background:#4a83cf;border-radius:3px 3px 0 0;min-height:2px}
- .dowlab{color:#888;font-size:11px;margin-top:4px}
+ .legend{display:flex;gap:5px;align-items:center;justify-content:flex-end;color:#73737b;font-size:11px;margin-top:8px}
+ .legend .d{width:11px;height:11px}
+ table{width:100%;border-collapse:collapse;font-size:13px}
+ th{text-align:left;color:#83838a;font-weight:500;font-size:10px;text-transform:uppercase;letter-spacing:.05em;padding:6px 8px;border-bottom:1px solid #2a2a2e}
+ td{padding:6px 8px;border-bottom:1px solid #1f1f23}
+ tr:last-child td{border-bottom:0}
+ .num{text-align:right;font-variant-numeric:tabular-nums}
+ tbody tr:hover,table tr:hover{background:#1f1f23}
+ .foot{color:#6a6a72;font-size:11px;margin-top:20px;line-height:1.7}
 </style>
-<h1>✳ Claude usage — all surfaces</h1>
-<div class=sub>Sources: ${sources.join(" + ") || "none yet"} · last push — ${lastPush || "never"}</div>
-<div class=grid>
+<div class=wrap>
+<header>
+ <div><h1>✳ Claude usage</h1><div class=meta>${sources.join(" · ") || "no sources"} &nbsp;·&nbsp; updated ${lastPush || "never"}</div></div>
+ <a class=logout href=/logout>Sign out</a>
+</header>
+
+<div class=cards>
  ${card("Sessions", fmt(totalSessions))}
  ${card("Messages", fmt(totalMessages))}
  ${card("Total tokens", fmtTok(totalTokens))}
- ${card("Web tokens (est.)", fmtTok(estTokens))}
+ ${card("Web tokens", fmtTok(estTokens) + est)}
  ${card("Active days", activeDays)}
  ${card("Current streak", currentStreak + "d")}
  ${card("Longest streak", longestStreak + "d")}
  ${card("Avg msgs / session", avgMsgs.toFixed(0))}
  ${card("Tool calls", fmtTok(totalTools))}
- ${card("Cache savings (est.)", usd(cacheSavings))}
- ${card("Favorite model", favoriteModel.replace("claude-",""))}
- ${card("Est. API cost", '<span class=big>'+usd(cost)+'</span>')}
- ${card("Est. $/mo (run rate)", usd(monthlyRunRate))}
- ${card("Busiest day", busiestDay ? `${busiestDay.slice(5)} · ${fmtTok(busiestN)}` : "—")}
  ${card("Peak hour", peakHour != null ? hr12(peakHour) : "—")}
+ ${card("Favorite model", favoriteModel.replace("claude-",""))}
+ ${card("Cache savings", usd(cacheSavings) + est)}
+ ${card("Est. API cost", usd(cost), "accent")}
+ ${card("Est. $/mo", usd(monthlyRunRate))}
 </div>
-<div class=heat>${heat}</div>
-<div class=legend>Less <span class="d l0"></span><span class="d l1"></span><span class="d l2"></span><span class="d l3"></span><span class="d l4"></span> More</div>
 
-<h2>Messages by weekday</h2>
-<div class=dow>${["S","M","T","W","T","F","S"].map((lab,i)=>{
-  const mx=Math.max(1,...dow); const h=Math.round(dow[i]/mx*60);
-  return `<div class=dowcol title="${fmt(dow[i])} msgs"><div class=dowbar style="height:${h}px"></div><div class=dowlab>${lab}</div></div>`;
-}).join("")}</div>
+<div class=panel style=margin-top:14px>
+ <h2>Activity — last 12 months</h2>
+ <div class=heatwrap>
+  <div class=months>${monthsHtml}</div>
+  <div class=heat>${heatHtml || '<span class=meta>no data</span>'}</div>
+ </div>
+ <div class=legend>Less <span class="d l0"></span><span class="d l1"></span><span class="d l2"></span><span class="d l3"></span><span class="d l4"></span> More</div>
+</div>
 
-<h2>Tokens per week (Code, input+output)</h2>
-<div class=dow style=height:90px>${weeks.length ? weeks.map(([wk,t])=>{
-  const mx=Math.max(1,...weeks.map(w=>w[1])); const h=Math.round(t/mx*64);
-  return `<div class=dowcol style=width:42px title="week of ${wk}: ${fmtTok(t)} tokens"><div class=dowbar style="width:28px;height:${h}px"></div><div class=dowlab>${wk.slice(5)}</div></div>`;
-}).join("") : '<span class=sub>no data</span>'}</div>
+<div class="row charts">
+ <div class=panel><h2>Time of day</h2>
+  ${barChart(hourCounts.map((c, h) => ({ c, h })), it => it.h % 3 === 0 ? it.h : "", it => it.c, it => `${hr12(it.h)}: ${fmt(it.c)} msgs`)}</div>
+ <div class=panel><h2>By weekday</h2>
+  ${barChart(["Su","Mo","Tu","We","Th","Fr","Sa"].map((lab, i) => ({ lab, i })), it => it.lab, it => dow[it.i], it => `${fmt(dow[it.i])} msgs`)}</div>
+ <div class=panel><h2>Tokens per week</h2>
+  ${weeks.length ? barChart(weeks, it => it[0].slice(5), it => it[1], it => `week of ${it[0]}: ${fmtTok(it[1])}`) : '<div class=meta>no data</div>'}</div>
+</div>
 
-<h2>Time of day (messages by hour, local)</h2>
-<div class=dow style=height:90px>${hourCounts.map((c,h)=>{
-  const mx=Math.max(1,...hourCounts); const ht=Math.round(c/mx*64);
-  return `<div class=dowcol style=width:22px title="${hr12(h)}: ${fmt(c)} msgs"><div class=dowbar style="width:14px;height:${ht}px"></div><div class=dowlab>${h%3===0?h:''}</div></div>`;
-}).join("")}</div>
+<div class="row tables">
+ <div class=panel><h2>By source</h2>
+  <table><tr><th>Source</th><th class=num>Sessions</th><th class=num>Messages</th><th class=num>Tokens</th></tr>
+  ${sources.map(s=>`<tr><td>${s}</td><td class=num>${fmt(perSource[s]?.sessions||0)}</td><td class=num>${fmt(perSource[s]?.messages||0)}</td><td class=num>${fmtTok(tokBySource[s]||0)}${s==="web"?"*":""}</td></tr>`).join("")}</table></div>
+ <div class=panel><h2>By project</h2>
+  <table><tr><th>Project</th><th class=num>Tokens</th><th class=num>Est. cost</th></tr>
+  ${projList.length ? projList.map(([p,a])=>`<tr><td title="${p}">${pretty(p)}</td><td class=num>${fmtTok(a.tokens)}</td><td class=num>${usd(a.cost)}</td></tr>`).join("") : "<tr><td colspan=3 class=meta>no project data yet</td></tr>"}</table></div>
+ <div class=panel><h2>Top tools</h2>
+  <table><tr><th>Tool</th><th class=num>Calls</th></tr>
+  ${topTools.length ? topTools.map(([t,c])=>`<tr><td>${t}</td><td class=num>${fmt(c)}</td></tr>`).join("") : "<tr><td colspan=2 class=meta>no tool data yet</td></tr>"}</table></div>
+ <div class=panel><h2>Tokens by model</h2>
+  <table><tr><th>Model</th><th class=num>Tokens</th></tr>
+  ${Object.entries(tokByModel).sort((a,b)=>b[1]-a[1]).map(([m,t])=>`<tr><td>${m.replace("claude-","")}</td><td class=num>${fmtTok(t)}</td></tr>`).join("")||"<tr><td>—</td><td class=num>0</td></tr>"}
+  ${estTokens?`<tr><td>web (est.)</td><td class=num>${fmtTok(estTokens)}</td></tr>`:""}</table></div>
+ <div class=panel><h2>Estimated cost (API list price)</h2>
+  <table><tr><th>Source</th><th>Model</th><th class=num>Cost</th></tr>
+  ${costRows.map(([s,m,c])=>`<tr><td>${s}</td><td>${m.replace("claude-","")}</td><td class=num>${usd(c)}</td></tr>`).join("")||"<tr><td colspan=3 class=meta>no token data</td></tr>"}
+  <tr><td colspan=2><b>Total</b></td><td class=num><b>${usd(cost)}</b></td></tr></table></div>
+</div>
 
-<h2>By source</h2>
-<table><tr><th>Source</th><th>Sessions</th><th>Messages</th><th>Tokens</th></tr>
-${sources.map(s=>`<tr><td>${s}</td><td>${fmt(perSource[s]?.sessions||0)}</td><td>${fmt(perSource[s]?.messages||0)}</td><td>${fmtTok(tokBySource[s]||0)}${s==="web"?" <span style=color:#888>(est.)</span>":""}</td></tr>`).join("")}
-</table>
-
-<h2>By project (Code)</h2>
-<table><tr><th>Project</th><th>Tokens</th><th>Est. cost</th></tr>
-${projList.length ? projList.map(([p,a])=>`<tr><td title="${p}">${pretty(p)}</td><td>${fmtTok(a.tokens)}</td><td>${usd(a.cost)}</td></tr>`).join("") : "<tr><td colspan=3 class=sub>no project data yet — run the updated collector</td></tr>"}
-</table>
-
-<h2>Top tools (Code)</h2>
-<table><tr><th>Tool</th><th>Calls</th></tr>
-${topTools.length ? topTools.map(([t,c])=>`<tr><td>${t}</td><td>${fmt(c)}</td></tr>`).join("") : "<tr><td colspan=2 class=sub>no tool data yet — run the updated collector</td></tr>"}
-</table>
-
-<h2>Tokens by model (input+output)</h2>
-<table><tr><th>Model</th><th>Tokens</th></tr>
-${Object.entries(tokByModel).sort((a,b)=>b[1]-a[1]).map(([m,t])=>`<tr><td>${m}</td><td>${fmtTok(t)}</td></tr>`).join("")||"<tr><td>—</td><td>0</td></tr>"}
-${estTokens?`<tr><td>web (est.) <span style=color:#888>~chars/4</span></td><td>${fmtTok(estTokens)}</td></tr>`:""}
-</table>
-
-<h2>Estimated cost at API list price</h2>
-<table><tr><th>Source</th><th>Model</th><th>Cost</th></tr>
-${costRows.map(([s,m,c])=>`<tr><td>${s}</td><td>${m}</td><td>${usd(c)}</td></tr>`).join("")||"<tr><td colspan=3>no token data</td></tr>"}
-<tr><td colspan=2><b>Total</b></td><td><b>${usd(cost)}</b></td></tr>
-</table>
-<p class=sub style=margin-top:24px>Cost is hypothetical (subscription usage is billed flat). Cache-write = 1.25× input, cache-read = 0.1× input. Web tokens are a rough ~chars/4 estimate (the export has no real counts) — excluded from "Total tokens" and from cost. Run rate = total cost ÷ day-span × 30.</p>`;
+<p class=foot>Cost is hypothetical — subscription usage is billed flat; this is what the same tokens would cost at API list price (cache-write 1.25× input, cache-read 0.1× input). Web tokens (*) are a rough ~chars/4 estimate — the export has no real counts — and are excluded from Total tokens and cost. Run rate = total cost ÷ Code day-span × 30.</p>
+</div>`;
 }
