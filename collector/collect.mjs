@@ -75,44 +75,61 @@ console.log(`Pushed ${source}: ${payload.daily.length} days, ${payload.modelUsag
 
 // ---- parsers ------------------------------------------------------------
 function fromTranscripts(dir, source) {
-  const files = walk(join(dir, "projects"));
+  const projectsDir = join(dir, "projects");
   const daily = {};            // date -> {messages,sessions,tool_calls}
   const dmt = {};              // date -> model -> tokens(in+out)
   const usage = {};            // model -> {input,output,cacheRead,cacheCreate}
   const sessionStart = {};     // sid -> date (first seen)
+  const hourly = {};           // hour(0-23) -> count
+  const tools = {};            // tool name -> count
+  const projUsage = {};        // project -> model -> {input,output,cacheRead,cacheCreate}
   let firstSession = null;
 
-  for (const fp of files) {
-    let lines;
-    try { lines = readFileSync(fp, "utf8").split("\n"); } catch { continue; }
-    for (const line of lines) {
-      const t = line.trim(); if (!t) continue;
-      let d; try { d = JSON.parse(t); } catch { continue; }
-      if (d.type !== "user" && d.type !== "assistant") continue;
-      const ts = d.timestamp; if (!ts) continue;
-      const date = localDate(ts);
-      const sid = d.sessionId;
+  const projects = existsSync(projectsDir)
+    ? readdirSync(projectsDir).filter(n => { try { return statSync(join(projectsDir, n)).isDirectory(); } catch { return false; } })
+    : [];
 
-      (daily[date] ??= { messages: 0, sessions: 0, tool_calls: 0 }).messages++;
-      if (sid && !(sid in sessionStart)) sessionStart[sid] = date;
-      if (!firstSession || ts < firstSession) firstSession = ts;
+  for (const project of projects) {
+    for (const fp of walk(join(projectsDir, project))) {
+      let lines;
+      try { lines = readFileSync(fp, "utf8").split("\n"); } catch { continue; }
+      for (const line of lines) {
+        const t = line.trim(); if (!t) continue;
+        let d; try { d = JSON.parse(t); } catch { continue; }
+        if (d.type !== "user" && d.type !== "assistant") continue;
+        const ts = d.timestamp; if (!ts) continue;
+        const date = localDate(ts);
+        const sid = d.sessionId;
 
-      if (d.type === "assistant") {
-        const msg = d.message || {};
-        const model = msg.model, u = msg.usage;
-        if (model && u) {
-          const io = (u.input_tokens || 0) + (u.output_tokens || 0);
-          (dmt[date] ??= {});
-          dmt[date][model] = (dmt[date][model] || 0) + io;
-          const mu = (usage[model] ??= { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 });
-          mu.input += u.input_tokens || 0;
-          mu.output += u.output_tokens || 0;
-          mu.cacheRead += u.cache_read_input_tokens || 0;
-          mu.cacheCreate += u.cache_creation_input_tokens || 0;
+        (daily[date] ??= { messages: 0, sessions: 0, tool_calls: 0 }).messages++;
+        hourly[new Date(ts).getHours()] = (hourly[new Date(ts).getHours()] || 0) + 1;
+        if (sid && !(sid in sessionStart)) sessionStart[sid] = date;
+        if (!firstSession || ts < firstSession) firstSession = ts;
+
+        if (d.type === "assistant") {
+          const msg = d.message || {};
+          const model = msg.model, u = msg.usage;
+          if (model && u) {
+            const io = (u.input_tokens || 0) + (u.output_tokens || 0);
+            (dmt[date] ??= {});
+            dmt[date][model] = (dmt[date][model] || 0) + io;
+            const add = (acc) => {
+              acc.input += u.input_tokens || 0;
+              acc.output += u.output_tokens || 0;
+              acc.cacheRead += u.cache_read_input_tokens || 0;
+              acc.cacheCreate += u.cache_creation_input_tokens || 0;
+            };
+            add(usage[model] ??= { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 });
+            add((projUsage[project] ??= {})[model] ??= { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 });
+          }
+          const c = msg.content;
+          if (Array.isArray(c))
+            for (const b of c)
+              if (b && b.type === "tool_use") {
+                daily[date].tool_calls++;
+                tools[b.name || "?"] = (tools[b.name || "?"] || 0) + 1;
+              }
         }
-        const c = msg.content;
-        if (Array.isArray(c))
-          daily[date].tool_calls += c.filter(b => b && b.type === "tool_use").length;
       }
     }
   }
@@ -124,6 +141,10 @@ function fromTranscripts(dir, source) {
     dailyModelTokens: Object.entries(dmt).flatMap(([date, mm]) =>
       Object.entries(mm).filter(([, t]) => t > 0).map(([model, tokens]) => ({ date, model, tokens }))),
     modelUsage: Object.entries(usage).map(([model, u]) => ({ model, ...u })),
+    hourly: Object.entries(hourly).map(([hour, count]) => ({ hour: +hour, count })),
+    tools: Object.entries(tools).map(([tool, count]) => ({ tool, count })),
+    projectUsage: Object.entries(projUsage).flatMap(([project, mm]) =>
+      Object.entries(mm).map(([model, u]) => ({ project, model, ...u }))),
   };
 }
 

@@ -81,6 +81,28 @@ async function ingest(request, env) {
     stmts.push(env.DB.prepare(
       "INSERT INTO model_usage (source,model,input_tokens,output_tokens,cache_read,cache_create) VALUES (?,?,?,?,?,?)"
     ).bind(source, r.model, r.input | 0, r.output | 0, r.cacheRead | 0, r.cacheCreate | 0));
+  // New tables — only touch them if the payload includes the array, so an older
+  // collector (no hourly/tools/projectUsage) doesn't wipe a source's data.
+  if (Array.isArray(body.hourly)) {
+    stmts.push(env.DB.prepare("DELETE FROM hourly WHERE source=?").bind(source));
+    for (const r of body.hourly)
+      stmts.push(env.DB.prepare("INSERT INTO hourly (source,hour,count) VALUES (?,?,?)")
+        .bind(source, r.hour | 0, r.count | 0));
+  }
+  if (Array.isArray(body.tools)) {
+    stmts.push(env.DB.prepare("DELETE FROM tools WHERE source=?").bind(source));
+    for (const r of body.tools)
+      stmts.push(env.DB.prepare("INSERT INTO tools (source,tool,count) VALUES (?,?,?)")
+        .bind(source, String(r.tool), r.count | 0));
+  }
+  if (Array.isArray(body.projectUsage)) {
+    stmts.push(env.DB.prepare("DELETE FROM project_usage WHERE source=?").bind(source));
+    for (const r of body.projectUsage)
+      stmts.push(env.DB.prepare(
+        "INSERT INTO project_usage (source,project,model,input_tokens,output_tokens,cache_read,cache_create) VALUES (?,?,?,?,?,?,?)"
+      ).bind(source, String(r.project), String(r.model), r.input | 0, r.output | 0, r.cacheRead | 0, r.cacheCreate | 0));
+  }
+
   stmts.push(env.DB.prepare(
     "INSERT OR REPLACE INTO meta (source,last_push,first_session) VALUES (?,?,?)"
   ).bind(source, now, body.firstSession || null));
@@ -129,18 +151,22 @@ ${failed ? '<div class=err>Wrong password</div>' : ''}
 // ---- dashboard ----------------------------------------------------------
 async function dashboard(request, env, url) {
   const headers = { "content-type": "text/html; charset=utf-8" };
-  const [daily, dmt, mu, meta] = await Promise.all([
+  const [daily, dmt, mu, meta, hourly, tools, proj] = await Promise.all([
     env.DB.prepare("SELECT * FROM daily").all(),
     env.DB.prepare("SELECT * FROM daily_model_tokens").all(),
     env.DB.prepare("SELECT * FROM model_usage").all(),
     env.DB.prepare("SELECT * FROM meta").all(),
+    env.DB.prepare("SELECT * FROM hourly").all(),
+    env.DB.prepare("SELECT * FROM tools").all(),
+    env.DB.prepare("SELECT * FROM project_usage").all(),
   ]);
 
-  return new Response(render(daily.results, dmt.results, mu.results, meta.results), { headers });
+  return new Response(render(daily.results, dmt.results, mu.results, meta.results,
+    hourly.results, tools.results, proj.results), { headers });
 }
 
 // ---- render -------------------------------------------------------------
-function render(daily, dmt, mu, meta) {
+function render(daily, dmt, mu, meta, hourly = [], toolRows = [], projRows = []) {
   const sources = [...new Set(daily.map(d => d.source))].sort();
 
   // per-date totals (all sources)
@@ -218,6 +244,39 @@ function render(daily, dmt, mu, meta) {
     perSource[r.source].sessions += r.sessions;
   }
 
+  // time-of-day
+  const hourCounts = Array(24).fill(0);
+  for (const r of hourly) hourCounts[r.hour] = (hourCounts[r.hour] || 0) + r.count;
+  const peakHour = hourCounts.some(x => x) ? hourCounts.indexOf(Math.max(...hourCounts)) : null;
+  const hr12 = h => { const ap = h < 12 ? "AM" : "PM"; const x = h % 12 === 0 ? 12 : h % 12; return `${x} ${ap}`; };
+
+  // top tools
+  const toolAgg = {};
+  for (const r of toolRows) toolAgg[r.tool] = (toolAgg[r.tool] || 0) + r.count;
+  const topTools = Object.entries(toolAgg).sort((a, b) => b[1] - a[1]).slice(0, 12);
+
+  // per-project tokens + cost
+  const projAgg = {};
+  for (const r of projRows) {
+    const p = PRICE[r.model];
+    const a = (projAgg[r.project] ??= { tokens: 0, cost: 0 });
+    a.tokens += (r.input_tokens || 0) + (r.output_tokens || 0);
+    if (p) a.cost += r.input_tokens / 1e6 * p.in + r.output_tokens / 1e6 * p.out
+                   + r.cache_create / 1e6 * p.in * 1.25 + r.cache_read / 1e6 * p.in * 0.1;
+  }
+  const projList = Object.entries(projAgg).sort((a, b) => b[1].cost - a[1].cost);
+
+  // weekly trend — real Code tokens by week (Sunday start)
+  const weekTok = {};
+  for (const r of dmt) {
+    if (/\(est\.\)/.test(r.model)) continue;
+    const d = new Date(r.date + "T00:00:00Z");
+    d.setUTCDate(d.getUTCDate() - d.getUTCDay());
+    const wk = d.toISOString().slice(0, 10);
+    weekTok[wk] = (weekTok[wk] || 0) + r.tokens;
+  }
+  const weeks = Object.entries(weekTok).sort((a, b) => a[0] < b[0] ? -1 : 1);
+
   const fmt = n => n.toLocaleString("en-US");
   const fmtTok = n => n >= 1e9 ? (n/1e9).toFixed(1)+"B" : n >= 1e6 ? (n/1e6).toFixed(1)+"M"
                     : n >= 1e3 ? (n/1e3).toFixed(1)+"K" : String(n);
@@ -288,6 +347,7 @@ function render(daily, dmt, mu, meta) {
  ${card("Est. API cost", '<span class=big>'+usd(cost)+'</span>')}
  ${card("Est. $/mo (run rate)", usd(monthlyRunRate))}
  ${card("Busiest day", busiestDay ? `${busiestDay.slice(5)} · ${fmtTok(busiestN)}` : "—")}
+ ${card("Peak hour", peakHour != null ? hr12(peakHour) : "—")}
 </div>
 <div class=heat>${heat}</div>
 <div class=legend>Less <span class="d l0"></span><span class="d l1"></span><span class="d l2"></span><span class="d l3"></span><span class="d l4"></span> More</div>
@@ -298,9 +358,31 @@ function render(daily, dmt, mu, meta) {
   return `<div class=dowcol title="${fmt(dow[i])} msgs"><div class=dowbar style="height:${h}px"></div><div class=dowlab>${lab}</div></div>`;
 }).join("")}</div>
 
+<h2>Tokens per week (Code, input+output)</h2>
+<div class=dow style=height:90px>${weeks.length ? weeks.map(([wk,t])=>{
+  const mx=Math.max(1,...weeks.map(w=>w[1])); const h=Math.round(t/mx*64);
+  return `<div class=dowcol style=width:42px title="week of ${wk}: ${fmtTok(t)} tokens"><div class=dowbar style="width:28px;height:${h}px"></div><div class=dowlab>${wk.slice(5)}</div></div>`;
+}).join("") : '<span class=sub>no data</span>'}</div>
+
+<h2>Time of day (messages by hour, local)</h2>
+<div class=dow style=height:90px>${hourCounts.map((c,h)=>{
+  const mx=Math.max(1,...hourCounts); const ht=Math.round(c/mx*64);
+  return `<div class=dowcol style=width:22px title="${hr12(h)}: ${fmt(c)} msgs"><div class=dowbar style="width:14px;height:${ht}px"></div><div class=dowlab>${h%3===0?h:''}</div></div>`;
+}).join("")}</div>
+
 <h2>By source</h2>
 <table><tr><th>Source</th><th>Sessions</th><th>Messages</th><th>Tokens</th></tr>
 ${sources.map(s=>`<tr><td>${s}</td><td>${fmt(perSource[s]?.sessions||0)}</td><td>${fmt(perSource[s]?.messages||0)}</td><td>${fmtTok(tokBySource[s]||0)}${s==="web"?" <span style=color:#888>(est.)</span>":""}</td></tr>`).join("")}
+</table>
+
+<h2>By project (Code)</h2>
+<table><tr><th>Project</th><th>Tokens</th><th>Est. cost</th></tr>
+${projList.length ? projList.map(([p,a])=>`<tr><td>${p}</td><td>${fmtTok(a.tokens)}</td><td>${usd(a.cost)}</td></tr>`).join("") : "<tr><td colspan=3 class=sub>no project data yet — run the updated collector</td></tr>"}
+</table>
+
+<h2>Top tools (Code)</h2>
+<table><tr><th>Tool</th><th>Calls</th></tr>
+${topTools.length ? topTools.map(([t,c])=>`<tr><td>${t}</td><td>${fmt(c)}</td></tr>`).join("") : "<tr><td colspan=2 class=sub>no tool data yet — run the updated collector</td></tr>"}
 </table>
 
 <h2>Tokens by model (input+output)</h2>
