@@ -154,19 +154,22 @@ function render(daily, dmt, mu, meta) {
     totalTools += r.tool_calls;
   }
 
-  // tokens by model (input+output) from daily_model_tokens
-  const tokByModel = {};
-  let totalTokens = 0;
+  // tokens by model — keep real (Code) separate from estimated (web "(est.)")
+  const tokByModel = {}, tokBySource = {};
+  let totalTokens = 0, estTokens = 0;
   for (const r of dmt) {
+    tokBySource[r.source] = (tokBySource[r.source] || 0) + r.tokens;
+    if (/\(est\.\)/.test(r.model)) { estTokens += r.tokens; continue; }
     tokByModel[r.model] = (tokByModel[r.model] || 0) + r.tokens;
     totalTokens += r.tokens;
   }
   for (const m of Object.keys(tokByModel)) if (!tokByModel[m]) delete tokByModel[m];
   const favoriteModel = Object.entries(tokByModel).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
 
-  // cost from model_usage
-  let cost = 0, costRows = [];
+  // cost + cache totals from model_usage
+  let cost = 0, costRows = [], totalCacheRead = 0, cacheSavings = 0;
   for (const r of mu) {
+    totalCacheRead += r.cache_read || 0;
     const p = PRICE[r.model]; if (!p) continue;
     const c = r.input_tokens / 1e6 * p.in
             + r.output_tokens / 1e6 * p.out
@@ -174,10 +177,12 @@ function render(daily, dmt, mu, meta) {
             + r.cache_read / 1e6 * p.in * 0.1;
     cost += c;
     costRows.push([r.source, r.model, c]);
+    // what cache reads saved vs paying full input price (0.1x → 1x)
+    cacheSavings += (r.cache_read || 0) / 1e6 * p.in * 0.9;
   }
   costRows.sort((a, b) => b[2] - a[2]);
 
-  // active days, streak, peak hour (peak hour not tracked per-day here → omit)
+  // dates, streaks, run-rate, busiest day, weekday distribution
   const dates = Object.keys(byDate).sort();
   const activeDays = dates.length;
   let longestStreak = 0, cur = 0, prev = null;
@@ -186,6 +191,24 @@ function render(daily, dmt, mu, meta) {
     cur = (prev && (d - prev) === 86400000) ? cur + 1 : 1;
     prev = d; if (cur > longestStreak) longestStreak = cur;
   }
+  let currentStreak = 0;                       // consecutive days up to the latest active day
+  for (let i = dates.length - 1; i > 0; i--) {
+    if (i === dates.length - 1) currentStreak = 1;
+    const a = new Date(dates[i] + "T00:00:00Z"), b = new Date(dates[i - 1] + "T00:00:00Z");
+    if (a - b === 86400000) currentStreak++; else break;
+  }
+  // run rate uses the span of days that actually have cost (Code), not the full
+  // history — web's year-plus of zero-cost activity would otherwise deflate it.
+  const realDates = [...new Set(dmt.filter(r => !/\(est\.\)/.test(r.model)).map(r => r.date))].sort();
+  const codeSpan = realDates.length
+    ? Math.round((new Date(realDates.at(-1) + "T00:00:00Z") - new Date(realDates[0] + "T00:00:00Z")) / 86400000) + 1
+    : 1;
+  const monthlyRunRate = cost / codeSpan * 30;
+  const avgMsgs = totalSessions ? totalMessages / totalSessions : 0;
+  let busiestDay = null, busiestN = 0;
+  for (const [d, n] of Object.entries(byDate)) if (n > busiestN) { busiestN = n; busiestDay = d; }
+  const dow = [0, 0, 0, 0, 0, 0, 0];
+  for (const [d, n] of Object.entries(byDate)) dow[new Date(d + "T00:00:00Z").getUTCDay()] += n;
 
   // per-source breakdown
   const perSource = {};
@@ -199,6 +222,7 @@ function render(daily, dmt, mu, meta) {
   const fmtTok = n => n >= 1e9 ? (n/1e9).toFixed(1)+"B" : n >= 1e6 ? (n/1e6).toFixed(1)+"M"
                     : n >= 1e3 ? (n/1e3).toFixed(1)+"K" : String(n);
   const usd = n => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const pct = n => (n * 100).toFixed(0) + "%";
 
   // heatmap grid
   const maxMsgs = Math.max(1, ...Object.values(byDate));
@@ -242,6 +266,10 @@ function render(daily, dmt, mu, meta) {
  td,th{padding:5px 16px 5px 0;text-align:left}th{color:#999;font-weight:500}
  h2{font-size:14px;color:#bbb;margin:26px 0 0}
  .big{font-size:23px;font-weight:700}
+ .dow{display:flex;gap:8px;align-items:flex-end;height:80px;margin-top:10px}
+ .dowcol{display:flex;flex-direction:column;align-items:center;justify-content:flex-end;width:30px}
+ .dowbar{width:18px;background:#4a83cf;border-radius:3px 3px 0 0;min-height:2px}
+ .dowlab{color:#888;font-size:11px;margin-top:4px}
 </style>
 <h1>✳ Claude usage — all surfaces</h1>
 <div class=sub>Sources: ${sources.join(" + ") || "none yet"} · last push — ${lastPush || "never"}</div>
@@ -249,23 +277,36 @@ function render(daily, dmt, mu, meta) {
  ${card("Sessions", fmt(totalSessions))}
  ${card("Messages", fmt(totalMessages))}
  ${card("Total tokens", fmtTok(totalTokens))}
+ ${card("Web tokens (est.)", fmtTok(estTokens))}
  ${card("Active days", activeDays)}
+ ${card("Current streak", currentStreak + "d")}
  ${card("Longest streak", longestStreak + "d")}
+ ${card("Avg msgs / session", avgMsgs.toFixed(0))}
  ${card("Tool calls", fmtTok(totalTools))}
+ ${card("Cache savings (est.)", usd(cacheSavings))}
  ${card("Favorite model", favoriteModel.replace("claude-",""))}
  ${card("Est. API cost", '<span class=big>'+usd(cost)+'</span>')}
+ ${card("Est. $/mo (run rate)", usd(monthlyRunRate))}
+ ${card("Busiest day", busiestDay ? `${busiestDay.slice(5)} · ${fmtTok(busiestN)}` : "—")}
 </div>
 <div class=heat>${heat}</div>
 <div class=legend>Less <span class="d l0"></span><span class="d l1"></span><span class="d l2"></span><span class="d l3"></span><span class="d l4"></span> More</div>
 
+<h2>Messages by weekday</h2>
+<div class=dow>${["S","M","T","W","T","F","S"].map((lab,i)=>{
+  const mx=Math.max(1,...dow); const h=Math.round(dow[i]/mx*60);
+  return `<div class=dowcol title="${fmt(dow[i])} msgs"><div class=dowbar style="height:${h}px"></div><div class=dowlab>${lab}</div></div>`;
+}).join("")}</div>
+
 <h2>By source</h2>
-<table><tr><th>Source</th><th>Sessions</th><th>Messages</th></tr>
-${sources.map(s=>`<tr><td>${s}</td><td>${fmt(perSource[s]?.sessions||0)}</td><td>${fmt(perSource[s]?.messages||0)}</td></tr>`).join("")}
+<table><tr><th>Source</th><th>Sessions</th><th>Messages</th><th>Tokens</th></tr>
+${sources.map(s=>`<tr><td>${s}</td><td>${fmt(perSource[s]?.sessions||0)}</td><td>${fmt(perSource[s]?.messages||0)}</td><td>${fmtTok(tokBySource[s]||0)}${s==="web"?" <span style=color:#888>(est.)</span>":""}</td></tr>`).join("")}
 </table>
 
 <h2>Tokens by model (input+output)</h2>
 <table><tr><th>Model</th><th>Tokens</th></tr>
 ${Object.entries(tokByModel).sort((a,b)=>b[1]-a[1]).map(([m,t])=>`<tr><td>${m}</td><td>${fmtTok(t)}</td></tr>`).join("")||"<tr><td>—</td><td>0</td></tr>"}
+${estTokens?`<tr><td>web (est.) <span style=color:#888>~chars/4</span></td><td>${fmtTok(estTokens)}</td></tr>`:""}
 </table>
 
 <h2>Estimated cost at API list price</h2>
@@ -273,5 +314,5 @@ ${Object.entries(tokByModel).sort((a,b)=>b[1]-a[1]).map(([m,t])=>`<tr><td>${m}</
 ${costRows.map(([s,m,c])=>`<tr><td>${s}</td><td>${m}</td><td>${usd(c)}</td></tr>`).join("")||"<tr><td colspan=3>no token data</td></tr>"}
 <tr><td colspan=2><b>Total</b></td><td><b>${usd(cost)}</b></td></tr>
 </table>
-<p class=sub style=margin-top:24px>Cost is hypothetical (subscription usage is billed flat). Cache-write = 1.25× input, cache-read = 0.1× input. Web activity carries no token/cost data.</p>`;
+<p class=sub style=margin-top:24px>Cost is hypothetical (subscription usage is billed flat). Cache-write = 1.25× input, cache-read = 0.1× input. Web tokens are a rough ~chars/4 estimate (the export has no real counts) — excluded from "Total tokens" and from cost. Run rate = total cost ÷ day-span × 30.</p>`;
 }

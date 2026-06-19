@@ -131,7 +131,15 @@ function fromWebExport(path, source) {
   const raw = JSON.parse(readFileSync(path, "utf8"));
   const convos = Array.isArray(raw) ? raw : (raw.conversations || []);
   const daily = {};
+  const estByDate = {};         // date -> estimated tokens (~chars/4)
   let firstSession = null;
+
+  const msgText = (m) => {
+    if (typeof m.text === "string" && m.text) return m.text;
+    if (Array.isArray(m.content))
+      return m.content.map(b => (b && typeof b.text === "string") ? b.text : "").join(" ");
+    return "";
+  };
 
   for (const c of convos) {
     const cStart = c.created_at || c.create_time || c.created;
@@ -147,13 +155,17 @@ function fromWebExport(path, source) {
       if (!ts) continue;
       const d = localDate(ts);
       (daily[d] ??= { messages: 0, sessions: 0, tool_calls: 0 }).messages++;
+      estByDate[d] = (estByDate[d] || 0) + Math.ceil(msgText(m).length / 4); // ~4 chars/token
     }
   }
-  // web export has no token usage
+  // Estimated tokens go under a clearly-labeled pseudo-model so the dashboard can
+  // keep them separate from real Code token counts and from the cost figure.
   return {
     source, firstSession,
     daily: Object.entries(daily).map(([date, v]) => ({ date, ...v })),
-    dailyModelTokens: [],
+    dailyModelTokens: Object.entries(estByDate)
+      .filter(([, t]) => t > 0)
+      .map(([date, tokens]) => ({ date, model: "web (est.)", tokens })),
     modelUsage: [],
   };
 }
