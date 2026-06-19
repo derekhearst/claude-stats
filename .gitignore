@@ -8,6 +8,7 @@ collector/collector.config.json
 # personal usage data & generated reports
 data/
 work-extract/
+web-extract/
 combined-stats.json
 dashboard.html
 *.zip
