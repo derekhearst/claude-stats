@@ -282,6 +282,11 @@ function render(daily, dmt, mu, meta, hourly = [], toolRows = [], projRows = [])
                     : n >= 1e3 ? (n/1e3).toFixed(1)+"K" : String(n);
   const usd = n => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
   const pct = n => (n * 100).toFixed(0) + "%";
+  // decode Claude Code's encoded working-dir name → last folder segment
+  const pretty = p => {
+    const parts = p.replace(/^([A-Za-z])--/, "$1:/").replace(/-/g, "/").split("/").filter(Boolean);
+    return parts.length ? parts[parts.length - 1] : p;
+  };
 
   // heatmap grid
   const maxMsgs = Math.max(1, ...Object.values(byDate));
@@ -377,7 +382,7 @@ ${sources.map(s=>`<tr><td>${s}</td><td>${fmt(perSource[s]?.sessions||0)}</td><td
 
 <h2>By project (Code)</h2>
 <table><tr><th>Project</th><th>Tokens</th><th>Est. cost</th></tr>
-${projList.length ? projList.map(([p,a])=>`<tr><td>${p}</td><td>${fmtTok(a.tokens)}</td><td>${usd(a.cost)}</td></tr>`).join("") : "<tr><td colspan=3 class=sub>no project data yet — run the updated collector</td></tr>"}
+${projList.length ? projList.map(([p,a])=>`<tr><td title="${p}">${pretty(p)}</td><td>${fmtTok(a.tokens)}</td><td>${usd(a.cost)}</td></tr>`).join("") : "<tr><td colspan=3 class=sub>no project data yet — run the updated collector</td></tr>"}
 </table>
 
 <h2>Top tools (Code)</h2>
