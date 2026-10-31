@@ -149,6 +149,18 @@ async function ingest(request, env) {
       ).bind(source, String(r.project), String(r.model), int(r.input), int(r.output), int(r.cacheRead), int(r.cacheCreate)));
   }
 
+  // The per-session list is one JSON row per source: one statement however many sessions.
+  if (Array.isArray(body.sessions)) {
+    const list = body.sessions.map(s => ({
+      id: String(s.id), start: String(s.start), end: String(s.end || s.start),
+      title: String(s.title || "").slice(0, 120), folder: String(s.folder || "").slice(0, 80),
+      messages: int(s.messages), toolCalls: int(s.toolCalls),
+      usage: Object.fromEntries(Object.entries(s.usage || {}).map(([m, u]) => [m, (u || []).slice(0, 4).map(int)])),
+    }));
+    stmts.push(env.DB.prepare("INSERT OR REPLACE INTO session_sets (source,data) VALUES (?,?)")
+      .bind(source, JSON.stringify(list)));
+  }
+
   stmts.push(env.DB.prepare(
     "INSERT OR REPLACE INTO meta (source,last_push,first_session) VALUES (?,?,?)"
   ).bind(source, now, body.firstSession || null));
@@ -197,160 +209,100 @@ ${failed ? '<div class=err>Wrong password</div>' : ''}
 // ---- dashboard ----------------------------------------------------------
 async function dashboard(request, env, url) {
   const headers = { "content-type": "text/html; charset=utf-8" };
-  const [daily, dmt, mu, meta, hourly, tools, proj] = await Promise.all([
+  const [daily, dmt, mu, meta, hourly, tools, sessionSets] = await Promise.all([
     env.DB.prepare("SELECT * FROM daily").all(),
     env.DB.prepare("SELECT * FROM daily_model_tokens").all(),
     env.DB.prepare("SELECT * FROM model_usage").all(),
     env.DB.prepare("SELECT * FROM meta").all(),
     env.DB.prepare("SELECT * FROM hourly").all(),
     env.DB.prepare("SELECT * FROM tools").all(),
-    env.DB.prepare("SELECT * FROM project_usage").all(),
+    env.DB.prepare("SELECT * FROM session_sets").all(),
   ]);
 
   await loadPrices();
   return new Response(render(daily.results, dmt.results, mu.results, meta.results,
-    hourly.results, tools.results, proj.results), { headers });
+    hourly.results, tools.results, sessionSets.results), { headers });
 }
 
 // ---- render -------------------------------------------------------------
-function render(daily, dmt, mu, meta, hourly = [], toolRows = [], projRows = []) {
-  const sources = [...new Set(daily.map(d => d.source))].sort();
-
-  // per-date totals (all sources)
-  const byDate = {};
-  let totalMessages = 0, totalSessions = 0, totalTools = 0;
-  for (const r of daily) {
-    byDate[r.date] ??= 0;
-    byDate[r.date] += r.messages;
-    totalMessages += r.messages;
-    totalSessions += r.sessions;
-    totalTools += r.tool_calls;
-  }
-
-  // tokens by model — keep real (Code) separate from estimated (web "(est.)")
-  const tokByModel = {}, tokBySource = {};
-  let totalTokens = 0, estTokens = 0;
-  for (const r of dmt) {
-    tokBySource[r.source] = (tokBySource[r.source] || 0) + r.tokens;
-    if (/\(est\.\)/.test(r.model)) { estTokens += r.tokens; continue; }
-    tokByModel[r.model] = (tokByModel[r.model] || 0) + r.tokens;
-    totalTokens += r.tokens;
-  }
-  for (const m of Object.keys(tokByModel)) if (!tokByModel[m]) delete tokByModel[m];
-  const favoriteModel = Object.entries(tokByModel).sort((a, b) => b[1] - a[1])[0]?.[0] || "—";
-
-  // cost + cache totals from model_usage
-  let cost = 0, costRows = [], totalCacheRead = 0, cacheSavings = 0;
+// The server prices every session and embeds the data; a small script in the page draws the parts
+// that follow the period switch (cards, spend chart, machine/model split, top sessions). Habits
+// (heatmap, time of day, weekday, tools) are all-time and drawn here.
+function render(daily, dmt, mu, meta, hourly = [], toolRows = [], sessionSets = []) {
+  const short = m => String(m).replace(/^claude-/, "").replace(/-\d{8}$/, "");
   const unpriced = new Set();
-  for (const r of mu) {
-    totalCacheRead += r.cache_read || 0;
-    const p = priceFor(r.model); if (!p) { unpriced.add(r.model); continue; }
-    const c = tokenCost(p, r);
-    cost += c;
-    costRows.push([r.source, r.model, c]);
-    // what cache reads saved vs paying full input price
-    cacheSavings += (r.cache_read || 0) / 1e6 * (p.in - cacheReadPrice(p));
-  }
-  costRows.sort((a, b) => b[2] - a[2]);
 
-  // dates, streaks, run-rate, busiest day, weekday distribution
+  // sessions, priced per model
+  const sessions = [];
+  const withSessions = new Set();
+  for (const set of sessionSets) {
+    let list; try { list = JSON.parse(set.data); } catch { continue; }
+    withSessions.add(set.source);
+    for (const s of list) {
+      const mc = {}; let cost = 0, tok = 0;
+      for (const [model, u] of Object.entries(s.usage || {})) {
+        const r = { input_tokens: u[0], output_tokens: u[1], cache_read: u[2], cache_create: u[3] };
+        tok += u[0] + u[1];
+        const p = priceFor(model); if (!p) { unpriced.add(model); continue; }
+        const c = tokenCost(p, r); cost += c; mc[short(model)] = (mc[short(model)] || 0) + c;
+      }
+      sessions.push({ s: set.source, t: s.title, f: s.folder, st: s.start, en: s.end,
+        m: s.messages, tc: s.toolCalls, c: +cost.toFixed(4), tok, mc });
+    }
+  }
+
+  // sources with no session list yet (an older collector, or web): their cost only counts in "All"
+  const legacy = {};
+  for (const r of mu) {
+    if (withSessions.has(r.source)) continue;
+    const p = priceFor(r.model); if (!p) { if (r.model !== "<synthetic>") unpriced.add(r.model); continue; }
+    const l = (legacy[r.source] ??= { cost: 0, tok: 0, mc: {} });
+    l.tok += (r.input_tokens || 0) + (r.output_tokens || 0);
+    const c = tokenCost(p, r); l.cost += c; l.mc[short(r.model)] = (l.mc[short(r.model)] || 0) + c;
+  }
+  const dayRows = daily.map(r => [r.date, r.source, r.messages, r.sessions]);
+  const sources = meta.map(m => ({ s: m.source, at: m.last_push, sessions: withSessions.has(m.source) }))
+    .sort((a, b) => a.s < b.s ? -1 : 1);
+
+  // ---- habits (all time) ----
+  const byDate = {};
+  for (const r of daily) byDate[r.date] = (byDate[r.date] || 0) + r.messages;
   const dates = Object.keys(byDate).sort();
-  const activeDays = dates.length;
+  const dow = [0, 0, 0, 0, 0, 0, 0];
+  for (const [d, n] of Object.entries(byDate)) dow[new Date(d + "T00:00:00Z").getUTCDay()] += n;
+  const hourCounts = Array(24).fill(0);
+  for (const r of hourly) hourCounts[r.hour] = (hourCounts[r.hour] || 0) + r.count;
+  const toolAgg = {};
+  for (const r of toolRows) toolAgg[r.tool] = (toolAgg[r.tool] || 0) + r.count;
+  const topTools = Object.entries(toolAgg).sort((a, b) => b[1] - a[1]).slice(0, 10);
+  const maxTool = topTools[0]?.[1] || 1;
   let longestStreak = 0, cur = 0, prev = null;
   for (const ds of dates) {
     const d = new Date(ds + "T00:00:00Z");
     cur = (prev && (d - prev) === 86400000) ? cur + 1 : 1;
     prev = d; if (cur > longestStreak) longestStreak = cur;
   }
-  let currentStreak = 0;                       // consecutive days up to the latest active day
-  for (let i = dates.length - 1; i > 0; i--) {
-    if (i === dates.length - 1) currentStreak = 1;
-    const a = new Date(dates[i] + "T00:00:00Z"), b = new Date(dates[i - 1] + "T00:00:00Z");
-    if (a - b === 86400000) currentStreak++; else break;
-  }
-  // run rate uses the span of days that actually have cost (Code), not the full
-  // history — web's year-plus of zero-cost activity would otherwise deflate it.
-  const realDates = [...new Set(dmt.filter(r => !/\(est\.\)/.test(r.model)).map(r => r.date))].sort();
-  const codeSpan = realDates.length
-    ? Math.round((new Date(realDates.at(-1) + "T00:00:00Z") - new Date(realDates[0] + "T00:00:00Z")) / 86400000) + 1
-    : 1;
-  const monthlyRunRate = cost / codeSpan * 30;
-  const avgMsgs = totalSessions ? totalMessages / totalSessions : 0;
-  let busiestDay = null, busiestN = 0;
-  for (const [d, n] of Object.entries(byDate)) if (n > busiestN) { busiestN = n; busiestDay = d; }
-  const dow = [0, 0, 0, 0, 0, 0, 0];
-  for (const [d, n] of Object.entries(byDate)) dow[new Date(d + "T00:00:00Z").getUTCDay()] += n;
-
-  // per-source breakdown
-  const perSource = {};
-  for (const r of daily) {
-    perSource[r.source] ??= { messages: 0, sessions: 0 };
-    perSource[r.source].messages += r.messages;
-    perSource[r.source].sessions += r.sessions;
-  }
-
-  // time-of-day
-  const hourCounts = Array(24).fill(0);
-  for (const r of hourly) hourCounts[r.hour] = (hourCounts[r.hour] || 0) + r.count;
-  const peakHour = hourCounts.some(x => x) ? hourCounts.indexOf(Math.max(...hourCounts)) : null;
-  const hr12 = h => { const ap = h < 12 ? "AM" : "PM"; const x = h % 12 === 0 ? 12 : h % 12; return `${x} ${ap}`; };
-
-  // top tools
-  const toolAgg = {};
-  for (const r of toolRows) toolAgg[r.tool] = (toolAgg[r.tool] || 0) + r.count;
-  const topTools = Object.entries(toolAgg).sort((a, b) => b[1] - a[1]).slice(0, 12);
-
-  // per-project tokens + cost
-  const projAgg = {};
-  for (const r of projRows) {
-    const p = priceFor(r.model);
-    const a = (projAgg[r.project] ??= { tokens: 0, cost: 0 });
-    a.tokens += (r.input_tokens || 0) + (r.output_tokens || 0);
-    if (p) a.cost += tokenCost(p, r);
-  }
-  const projList = Object.entries(projAgg).sort((a, b) => b[1].cost - a[1].cost);
-
-  // weekly trend — real Code tokens by week (Sunday start)
-  const weekTok = {};
-  for (const r of dmt) {
-    if (/\(est\.\)/.test(r.model)) continue;
-    const d = new Date(r.date + "T00:00:00Z");
-    d.setUTCDate(d.getUTCDate() - d.getUTCDay());
-    const wk = d.toISOString().slice(0, 10);
-    weekTok[wk] = (weekTok[wk] || 0) + r.tokens;
-  }
-  const weeks = Object.entries(weekTok).sort((a, b) => a[0] < b[0] ? -1 : 1);
 
   const fmt = n => n.toLocaleString("en-US");
-  const fmtTok = n => n >= 1e9 ? (n/1e9).toFixed(1)+"B" : n >= 1e6 ? (n/1e6).toFixed(1)+"M"
-                    : n >= 1e3 ? (n/1e3).toFixed(1)+"K" : String(n);
-  const usd = n => "$" + n.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
-  const pct = n => (n * 100).toFixed(0) + "%";
-  // decode Claude Code's encoded working-dir name → last folder segment
-  const pretty = p => {
-    const parts = p.replace(/^([A-Za-z])--/, "$1:/").replace(/-/g, "/").split("/").filter(Boolean);
-    return parts.length ? parts[parts.length - 1] : p;
-  };
+  const esc = s => String(s).replace(/[&<>"']/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]);
+  const hr12 = h => `${h % 12 === 0 ? 12 : h % 12}${h < 12 ? "a" : "p"}`;
 
-  // activity heatmap — windowed to the last 53 weeks so a single old web
-  // conversation doesn't stretch it into a huge empty expanse
   const maxMsgs = Math.max(1, ...Object.values(byDate));
   let heatHtml = "", monthsHtml = "";
   if (dates.length) {
     const end = new Date(dates.at(-1) + "T00:00:00Z");
-    end.setUTCDate(end.getUTCDate() + (6 - end.getUTCDay()));   // Saturday of latest week
+    end.setUTCDate(end.getUTCDate() + (6 - end.getUTCDay()));
     const start = new Date(end);
-    start.setUTCDate(start.getUTCDate() - (53 * 7 - 1));        // 53 weeks back, Sunday
+    start.setUTCDate(start.getUTCDate() - (53 * 7 - 1));
     const wks = [];
     for (let d = new Date(start); d <= end; d.setUTCDate(d.getUTCDate() + 1)) {
       const iso = d.toISOString().slice(0, 10);
-      const wk = Math.floor((d - start) / (7 * 86400000));
-      (wks[wk] ??= []).push(iso);
+      (wks[Math.floor((d - start) / (7 * 86400000))] ??= []).push(iso);
     }
     heatHtml = wks.map(wk => `<div class=col>${wk.map(iso => {
       const v = byDate[iso] || 0;
       const lvl = v ? Math.min(4, Math.ceil(v / maxMsgs * 4)) : 0;
-      return `<div class="d l${lvl}" title="${v ? `${iso}: ${fmt(v)} msgs` : iso}"></div>`;
+      return `<div class="d l${lvl}" title="${v ? `${iso}: ${fmt(v)} messages` : iso}"></div>`;
     }).join("")}</div>`).join("");
     const MON = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
     let lastM = -1;
@@ -360,125 +312,244 @@ function render(daily, dmt, mu, meta, hourly = [], toolRows = [], projRows = [])
       return `<div class=mlab>${lab}</div>`;
     }).join("");
   }
-
-  const card = (l, v, cls = "") => `<div class="card ${cls}"><div class=lbl>${l}</div><div class=val>${v}</div></div>`;
-  const lastPush = meta.map(m => `${m.source} ${(m.last_push||"").slice(5,16).replace("T"," ")}`).join(" · ");
-  const est = ' <span class=tag>est</span>';
-  // generic evenly-spaced bar chart (flex:1 columns → consistent spacing)
-  const barChart = (items, labFn, valFn, titleFn) => {
-    const mx = Math.max(1, ...items.map(valFn));
-    return `<div class=chart>${items.map((it, i) => {
-      const h = Math.round(valFn(it) / mx * 100);
-      return `<div class=bcol title="${titleFn(it, i)}"><div class=bar style="height:${h}px"></div><div class=blab>${labFn(it, i)}</div></div>`;
-    }).join("")}</div>`;
+  const vbars = (vals, labFn, titleFn) => {
+    const mx = Math.max(1, ...vals);
+    return `<div class=vchart>${vals.map((v, i) =>
+      `<div class=vcol title="${titleFn(i, v)}"><div class=vbar style="height:${Math.round(v / mx * 100)}%"></div><div class=vlab>${labFn(i)}</div></div>`).join("")}</div>`;
   };
 
-  return `<!doctype html><html><meta charset=utf-8>
+  // JSON for the page script; < escaped so no string can close the script tag
+  const firstCode = meta.filter(m => m.source !== "web" && m.first_session).map(m => m.first_session).sort()[0] || null;
+  const data = JSON.stringify({ sessions, legacy, dayRows, sources, firstCode }).replace(/</g, "\\u003c");
+
+  return `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
 <title>Claude usage</title>
 <style>
+ :root{--bg:#0e0e10;--panel:#17171a;--line:#26262b;--soft:#1e1e22;--text:#e7e7ea;--muted:#8b8b93;--faint:#5f5f67;
+  --accent:#6ba3f0;--warn:#e0b450;--opus:#6ba3f0;--sonnet:#6fcf9f;--haiku:#e0c36b;--fable:#c18cf0;--other:#8b8b93}
  *{box-sizing:border-box}
- body{background:#0f0f11;color:#e6e6e8;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;padding:28px 22px}
- .wrap{max-width:1080px;margin:0 auto}
- header{display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:10px;margin-bottom:20px}
- h1{font-size:20px;font-weight:650;margin:0;letter-spacing:-.01em}
- .meta{color:#73737b;font-size:12px;margin-top:3px}
- a.logout{color:#8a8a90;font-size:12px;text-decoration:none;border:1px solid #2a2a2e;padding:5px 11px;border-radius:7px}
- a.logout:hover{color:#ddd;border-color:#3a3a40}
- .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px}
- .card{background:#1a1a1d;border:1px solid #27272b;border-radius:12px;padding:14px 16px}
- .card.accent{background:linear-gradient(140deg,#1c2a44,#1a1a1d);border-color:#31486b}
- .lbl{color:#83838a;font-size:11px;text-transform:uppercase;letter-spacing:.05em;margin-bottom:8px}
- .val{font-size:22px;font-weight:650;letter-spacing:-.01em}
- .tag{font-size:10px;color:#73737b;font-weight:500;vertical-align:middle}
- .row{display:grid;gap:14px;margin-top:14px}
- .charts{grid-template-columns:repeat(auto-fit,minmax(290px,1fr))}
- .tables{grid-template-columns:repeat(auto-fit,minmax(330px,1fr))}
- .panel{background:#1a1a1d;border:1px solid #27272b;border-radius:12px;padding:16px 18px}
- h2{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.06em;color:#9a9aa2;margin:0 0 12px}
- .chart{display:flex;align-items:flex-end;gap:4px;height:124px}
- .bcol{flex:1;min-width:0;display:flex;flex-direction:column;align-items:center;justify-content:flex-end;height:100%}
- .bar{width:72%;max-width:24px;background:#3b6fb0;border-radius:3px 3px 0 0;min-height:2px}
- .bcol:hover .bar{background:#6ba3f0}
- .blab{color:#73737b;font-size:10px;margin-top:6px;white-space:nowrap;height:12px}
- .heatwrap{overflow-x:auto;padding-bottom:2px}
- .months{display:flex;height:14px}
- .mlab{width:15px;flex:none;font-size:10px;color:#73737b}
- .heat{display:flex;gap:3px}
- .col{display:flex;flex-direction:column;gap:3px}
- .d{width:12px;height:12px;border-radius:3px;background:#1f1f23}
- .l1{background:#1e3a5f}.l2{background:#2f5b94}.l3{background:#4a83cf}.l4{background:#6ba3f0}
- .legend{display:flex;gap:5px;align-items:center;justify-content:flex-end;color:#73737b;font-size:11px;margin-top:8px}
- .legend .d{width:11px;height:11px}
+ body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",system-ui,sans-serif;margin:0;padding:24px 16px 40px}
+ .wrap{max-width:1120px;margin:0 auto}
+ header{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:12px;margin-bottom:6px}
+ h1{font-size:19px;font-weight:650;margin:0;letter-spacing:-.01em}
+ .chips{display:flex;flex-wrap:wrap;gap:6px;margin:10px 0 18px}
+ .chip{font-size:12px;color:var(--muted);background:var(--panel);border:1px solid var(--line);border-radius:999px;padding:3px 10px}
+ .chip b{color:var(--text);font-weight:600}.chip.stale{border-color:#5a4720;color:var(--warn)}
+ .controls{display:flex;gap:10px;align-items:center}
+ .seg{display:inline-flex;background:var(--panel);border:1px solid var(--line);border-radius:9px;padding:3px}
+ .seg button{background:none;border:0;color:var(--muted);font:inherit;font-size:13px;padding:5px 12px;border-radius:6px;cursor:pointer}
+ .seg button.on{background:#2a3c57;color:#fff}
+ a.logout{color:var(--muted);font-size:12px;text-decoration:none;border:1px solid var(--line);padding:6px 11px;border-radius:8px}
+ .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
+ .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
+ .card.hero{background:linear-gradient(140deg,#1b2a42,var(--panel) 70%);border-color:#2f4668}
+ .lbl{color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.06em}
+ .val{font-size:24px;font-weight:650;letter-spacing:-.02em;margin-top:4px;font-variant-numeric:tabular-nums}
+ .sub{color:var(--faint);font-size:12px;margin-top:2px}
+ .grid{display:grid;gap:12px;margin-top:12px}
+ .g-main{grid-template-columns:2fr 1fr}
+ .g-3{grid-template-columns:repeat(3,1fr)}
+ @media(max-width:860px){.g-main,.g-3{grid-template-columns:1fr}}
+ .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px;min-width:0}
+ h2{font-size:12px;font-weight:600;text-transform:uppercase;letter-spacing:.07em;color:var(--muted);margin:0 0 14px;display:flex;justify-content:space-between;align-items:center;gap:8px}
+ h2 span{text-transform:none;letter-spacing:0;font-weight:500;color:var(--faint)}
+ .spend{display:flex;align-items:flex-end;gap:2px;height:170px;border-bottom:1px solid var(--line)}
+ .scol{flex:1;min-width:0;height:100%;display:flex;flex-direction:column-reverse;cursor:default}
+ .scol:hover{background:var(--soft)}
+ .seg-bar{width:100%}
+ .xlab{display:flex;justify-content:space-between;color:var(--faint);font-size:11px;margin-top:6px}
+ .legend{display:flex;flex-wrap:wrap;gap:12px;margin-top:10px;font-size:12px;color:var(--muted)}
+ .sw{display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:5px;vertical-align:0}
+ .hb{margin-bottom:11px}.hb:last-child{margin-bottom:0}
+ .hb-top{display:flex;justify-content:space-between;font-size:13px;margin-bottom:4px;gap:8px}
+ .hb-top span:last-child{font-variant-numeric:tabular-nums;color:var(--muted)}
+ .track{height:7px;background:var(--soft);border-radius:4px;overflow:hidden;display:flex}
+ .fill{height:100%}
+ .tools{display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:10px}
+ input,select{background:var(--bg);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:6px 10px;font:inherit;font-size:13px}
+ input{width:220px;max-width:100%}
  table{width:100%;border-collapse:collapse;font-size:13px}
- th{text-align:left;color:#83838a;font-weight:500;font-size:10px;text-transform:uppercase;letter-spacing:.05em;padding:6px 8px;border-bottom:1px solid #2a2a2e}
- td{padding:6px 8px;border-bottom:1px solid #1f1f23}
- tr:last-child td{border-bottom:0}
- .num{text-align:right;font-variant-numeric:tabular-nums}
- tbody tr:hover,table tr:hover{background:#1f1f23}
- .foot{color:#6a6a72;font-size:11px;margin-top:20px;line-height:1.7}
+ th{text-align:left;color:var(--muted);font-weight:500;font-size:11px;text-transform:uppercase;letter-spacing:.05em;padding:7px 8px;border-bottom:1px solid var(--line);white-space:nowrap}
+ td{padding:8px;border-bottom:1px solid #1d1d21;vertical-align:top}
+ tbody tr:hover{background:var(--soft)}
+ .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+ .title{max-width:520px}.title div:first-child{overflow:hidden;text-overflow:ellipsis}
+ .muted{color:var(--faint);font-size:12px}
+ .pill{font-size:11px;padding:1px 7px;border-radius:999px;background:var(--soft);color:var(--muted);white-space:nowrap}
+ .tablewrap{overflow-x:auto}
+ .more{margin-top:10px;background:none;border:1px solid var(--line);color:var(--muted);border-radius:8px;padding:6px 14px;cursor:pointer;font:inherit;font-size:13px}
+ .heatwrap{overflow-x:auto}
+ .months{display:flex;height:14px}.mlab{width:15px;flex:none;font-size:10px;color:var(--faint)}
+ .heat{display:flex;gap:3px}.col{display:flex;flex-direction:column;gap:3px}
+ .d{width:12px;height:12px;border-radius:3px;background:#1d1d21}
+ .l1{background:#1e3a5f}.l2{background:#2f5b94}.l3{background:#4a83cf}.l4{background:#6ba3f0}
+ .vchart{display:flex;align-items:flex-end;gap:3px;height:110px}
+ .vcol{flex:1;min-width:0;height:100%;display:flex;flex-direction:column;justify-content:flex-end;align-items:center}
+ .vbar{width:70%;background:#3b6fb0;border-radius:3px 3px 0 0;min-height:2px}
+ .vcol:hover .vbar{background:var(--accent)}
+ .vlab{color:var(--faint);font-size:10px;height:14px;margin-top:4px}
+ .foot{color:var(--faint);font-size:12px;margin-top:22px;line-height:1.7}
+ .empty{color:var(--faint);font-size:13px;padding:20px 0;text-align:center}
 </style>
 <div class=wrap>
 <header>
- <div><h1>✳ Claude usage</h1><div class=meta>${sources.join(" · ") || "no sources"} &nbsp;·&nbsp; updated ${lastPush || "never"}</div></div>
- <a class=logout href=/logout>Sign out</a>
-</header>
-
-<div class=cards>
- ${card("Sessions", fmt(totalSessions))}
- ${card("Messages", fmt(totalMessages))}
- ${card("Total tokens", fmtTok(totalTokens))}
- ${card("Web tokens", fmtTok(estTokens) + est)}
- ${card("Active days", activeDays)}
- ${card("Current streak", currentStreak + "d")}
- ${card("Longest streak", longestStreak + "d")}
- ${card("Avg msgs / session", avgMsgs.toFixed(0))}
- ${card("Tool calls", fmtTok(totalTools))}
- ${card("Peak hour", peakHour != null ? hr12(peakHour) : "—")}
- ${card("Favorite model", favoriteModel.replace("claude-",""))}
- ${card("Cache savings", usd(cacheSavings) + est)}
- ${card("Est. API cost", usd(cost), "accent")}
- ${card("Est. $/mo", usd(monthlyRunRate))}
-</div>
-
-<div class=panel style=margin-top:14px>
- <h2>Activity — last 12 months</h2>
- <div class=heatwrap>
-  <div class=months>${monthsHtml}</div>
-  <div class=heat>${heatHtml || '<span class=meta>no data</span>'}</div>
+ <h1>✳ Claude usage</h1>
+ <div class=controls>
+  <div class=seg id=period><button data-d=7>7d</button><button data-d=30>30d</button><button data-d=90>90d</button><button data-d=0>All</button></div>
+  <a class=logout href=/logout>Sign out</a>
  </div>
- <div class=legend>Less <span class="d l0"></span><span class="d l1"></span><span class="d l2"></span><span class="d l3"></span><span class="d l4"></span> More</div>
+</header>
+<div class=chips id=chips></div>
+
+<div class=cards id=cards></div>
+
+<div class="grid g-main">
+ <div class=panel><h2>Spend <span id=spend-note></span></h2><div class=spend id=spend></div><div class=xlab id=spend-x></div><div class=legend id=legend></div></div>
+ <div class=panel><h2>By machine</h2><div id=machines></div><h2 style=margin-top:20px>By model</h2><div id=models></div></div>
 </div>
 
-<div class="row charts">
- <div class=panel><h2>Time of day</h2>
-  ${barChart(hourCounts.map((c, h) => ({ c, h })), it => it.h % 3 === 0 ? it.h : "", it => it.c, it => `${hr12(it.h)}: ${fmt(it.c)} msgs`)}</div>
- <div class=panel><h2>By weekday</h2>
-  ${barChart(["Su","Mo","Tu","We","Th","Fr","Sa"].map((lab, i) => ({ lab, i })), it => it.lab, it => dow[it.i], it => `${fmt(dow[it.i])} msgs`)}</div>
- <div class=panel><h2>Tokens per week</h2>
-  ${weeks.length ? barChart(weeks, it => it[0].slice(5), it => it[1], it => `week of ${it[0]}: ${fmtTok(it[1])}`) : '<div class=meta>no data</div>'}</div>
+<div class="grid">
+ <div class=panel>
+  <h2>Top sessions <span id=ses-note></span></h2>
+  <div class=tools>
+   <input id=q type=search placeholder="Search prompts and folders">
+   <div style="display:flex;gap:8px"><select id=src><option value="">All machines</option></select>
+   <select id=sort><option value=c>Most expensive</option><option value=st>Newest</option><option value=tok>Most tokens</option><option value=m>Most messages</option></select></div>
+  </div>
+  <div class=tablewrap><table><thead><tr><th>Started</th><th>Session</th><th>Machine</th><th class=num>Length</th><th class=num>Msgs</th><th>Model</th><th class=num>Cost</th></tr></thead><tbody id=rows></tbody></table></div>
+  <button class=more id=more hidden>Show 25 more</button>
+ </div>
 </div>
 
-<div class="row tables">
- <div class=panel><h2>By source</h2>
-  <table><tr><th>Source</th><th class=num>Sessions</th><th class=num>Messages</th><th class=num>Tokens</th></tr>
-  ${sources.map(s=>`<tr><td>${s}</td><td class=num>${fmt(perSource[s]?.sessions||0)}</td><td class=num>${fmt(perSource[s]?.messages||0)}</td><td class=num>${fmtTok(tokBySource[s]||0)}${s==="web"?"*":""}</td></tr>`).join("")}</table></div>
- <div class=panel><h2>By project</h2>
-  <table><tr><th>Project</th><th class=num>Tokens</th><th class=num>Est. cost</th></tr>
-  ${projList.length ? projList.map(([p,a])=>`<tr><td title="${p}">${pretty(p)}</td><td class=num>${fmtTok(a.tokens)}</td><td class=num>${usd(a.cost)}</td></tr>`).join("") : "<tr><td colspan=3 class=meta>no project data yet</td></tr>"}</table></div>
- <div class=panel><h2>Top tools</h2>
-  <table><tr><th>Tool</th><th class=num>Calls</th></tr>
-  ${topTools.length ? topTools.map(([t,c])=>`<tr><td>${t}</td><td class=num>${fmt(c)}</td></tr>`).join("") : "<tr><td colspan=2 class=meta>no tool data yet</td></tr>"}</table></div>
- <div class=panel><h2>Tokens by model</h2>
-  <table><tr><th>Model</th><th class=num>Tokens</th></tr>
-  ${Object.entries(tokByModel).sort((a,b)=>b[1]-a[1]).map(([m,t])=>`<tr><td>${m.replace("claude-","")}</td><td class=num>${fmtTok(t)}</td></tr>`).join("")||"<tr><td>—</td><td class=num>0</td></tr>"}
-  ${estTokens?`<tr><td>web (est.)</td><td class=num>${fmtTok(estTokens)}</td></tr>`:""}</table></div>
- <div class=panel><h2>Estimated cost (API list price)</h2>
-  <table><tr><th>Source</th><th>Model</th><th class=num>Cost</th></tr>
-  ${costRows.map(([s,m,c])=>`<tr><td>${s}</td><td>${m.replace("claude-","")}</td><td class=num>${usd(c)}</td></tr>`).join("")||"<tr><td colspan=3 class=meta>no token data</td></tr>"}
-  <tr><td colspan=2><b>Total</b></td><td class=num><b>${usd(cost)}</b></td></tr></table></div>
+<div class="grid">
+ <div class=panel>
+  <h2>Activity <span>messages per day, last 12 months · longest streak ${longestStreak} days</span></h2>
+  <div class=heatwrap><div class=months>${monthsHtml}</div><div class=heat>${heatHtml || '<div class=empty>No data</div>'}</div></div>
+ </div>
+</div>
+<div class="grid g-3">
+ <div class=panel><h2>Time of day</h2>${vbars(hourCounts, i => i % 6 === 0 ? hr12(i) : "", (i, v) => `${hr12(i)}: ${fmt(v)} messages`)}</div>
+ <div class=panel><h2>Weekday</h2>${vbars(dow, i => "SMTWTFS"[i], (i, v) => `${["Sun","Mon","Tue","Wed","Thu","Fri","Sat"][i]}: ${fmt(v)} messages`)}</div>
+ <div class=panel><h2>Top tools</h2>${topTools.map(([t, c]) => `<div class=hb><div class=hb-top><span>${esc(t)}</span><span>${fmt(c)}</span></div><div class=track><div class=fill style="width:${(c / maxTool * 100).toFixed(1)}%;background:#3b6fb0"></div></div></div>`).join("") || '<div class=empty>No data</div>'}</div>
 </div>
 
-<p class=foot>Cost is hypothetical — subscription usage is billed flat; this is what the same tokens would cost at API list price (prices from the ${priceSource}, cache reads and writes at each model's own rates).${unpriced.size ? ` No price yet for ${[...unpriced].join(", ")}; those tokens are left out of cost.` : ""} Web tokens (*) are a rough ~chars/4 estimate — the export has no real counts — and are excluded from Total tokens and cost. Run rate = total cost ÷ Code day-span × 30.</p>
-</div>`;
+<p class=foot>Cost is hypothetical: subscription use is billed flat, so this is what the same tokens would cost at API list price (prices from the ${esc(priceSource)}, cache reads and writes at each model's own rates). A session's cost counts on the day it started. Machines without a session list yet count only in <b>All</b>.${unpriced.size ? ` No price yet for ${esc([...unpriced].join(", "))}; those tokens are left out.` : ""} Web conversations have no token counts, so they add to sessions and activity but not cost.</p>
+</div>
+<script>
+const D = ${data};
+const $ = id => document.getElementById(id);
+const esc = s => String(s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);
+const usd = n => "$" + n.toLocaleString("en-US", { minimumFractionDigits: n < 100 ? 2 : 0, maximumFractionDigits: n < 100 ? 2 : 0 });
+const tokf = n => n >= 1e9 ? (n/1e9).toFixed(1)+"B" : n >= 1e6 ? (n/1e6).toFixed(1)+"M" : n >= 1e3 ? (n/1e3).toFixed(0)+"K" : String(n);
+const family = m => /opus/.test(m) ? "opus" : /sonnet/.test(m) ? "sonnet" : /haiku/.test(m) ? "haiku" : /fable|mythos/.test(m) ? "fable" : "other";
+const color = m => "var(--" + family(m) + ")";
+const dayKey = d => d.getFullYear() + "-" + String(d.getMonth()+1).padStart(2,"0") + "-" + String(d.getDate()).padStart(2,"0");
+const ago = iso => { const h = (Date.now() - new Date(iso)) / 36e5; return h < 1 ? "just now" : h < 48 ? Math.round(h) + "h ago" : Math.round(h/24) + "d ago"; };
+const dur = (a, b) => { const m = Math.max(0, (new Date(b) - new Date(a)) / 6e4); return m < 60 ? Math.round(m) + "m" : m < 1440 ? (m/60).toFixed(1) + "h" : (m/1440).toFixed(1) + "d"; };
+
+let period = 30, shown = 25;
+try { const p = localStorage.getItem("period"); if (p !== null) period = +p; } catch {}
+
+$("chips").innerHTML = D.sources.map(s => {
+  const stale = (Date.now() - new Date(s.at)) / 36e5 > (s.s === "web" ? 24 * 45 : 36);
+  return '<span class="chip' + (stale ? " stale" : "") + '" title="' + (s.sessions ? "" : "no session list yet; counts only in All") + '"><b>' + esc(s.s) + '</b> ' + ago(s.at) + (s.sessions ? "" : " · totals only") + '</span>';
+}).join("");
+for (const s of D.sources) $("src").insertAdjacentHTML("beforeend", '<option>' + esc(s.s) + '</option>');
+
+function inPeriod(dateStr) {
+  if (!period) return true;
+  const since = new Date(); since.setHours(0,0,0,0); since.setDate(since.getDate() - period + 1);
+  return new Date(dateStr.length === 10 ? dateStr + "T00:00:00" : dateStr) >= since;
+}
+
+function draw() {
+  document.querySelectorAll("#period button").forEach(b => b.classList.toggle("on", +b.dataset.d === period));
+  const ses = D.sessions.filter(s => inPeriod(s.st));
+  const days = D.dayRows.filter(r => inPeriod(r[0]));
+  const legacy = period ? {} : D.legacy;
+
+  let cost = 0, tok = 0, sesCost = 0; const byMachine = {}, byModel = {};
+  for (const s of ses) {
+    cost += s.c; sesCost += s.c; tok += s.tok;
+    byMachine[s.s] = (byMachine[s.s] || 0) + s.c;
+    for (const [m, c] of Object.entries(s.mc)) byModel[m] = (byModel[m] || 0) + c;
+  }
+  for (const [src, l] of Object.entries(legacy)) {
+    cost += l.cost; tok += l.tok; byMachine[src] = (byMachine[src] || 0) + l.cost;
+    for (const [m, c] of Object.entries(l.mc)) byModel[m] = (byModel[m] || 0) + c;
+  }
+  const sessionsN = days.reduce((a, r) => a + r[3], 0);
+  const activeDays = new Set(days.map(r => r[0])).size;
+  let spanDays = period;
+  // "All" runs from the first Code session: web history goes back further but has no cost to chart
+  if (!period) { const first = D.firstCode || D.dayRows.map(r => r[0]).sort()[0]; spanDays = first ? Math.round((new Date() - new Date(first.slice(0, 10) + "T00:00:00")) / 864e5) + 1 : 1; }
+  const label = period ? "last " + period + " days" : "all time";
+  const card = (l, v, sub, cls) => '<div class="card ' + (cls || "") + '"><div class=lbl>' + l + '</div><div class=val>' + v + '</div>' + (sub ? '<div class=sub>' + sub + '</div>' : "") + '</div>';
+  $("cards").innerHTML =
+    card("Est. API cost", usd(cost), label, "hero") +
+    card("Per month", usd(cost / Math.max(1, spanDays) * 30), "at this pace") +
+    card("Sessions", sessionsN.toLocaleString(), ses.length ? usd(sesCost / ses.length) + " avg per Code session" : "") +
+    card("Active days", activeDays + (period ? " / " + period : ""), "") +
+    card("Tokens", tokf(tok), "input + output");
+
+  // spend chart: daily bars (weekly when the range is long), stacked by model family
+  const buckets = new Map(); const weekly = spanDays > 120;
+  const start = new Date(); start.setHours(0,0,0,0); start.setDate(start.getDate() - spanDays + 1);
+  for (let d = new Date(start); d <= new Date(); d.setDate(d.getDate() + (weekly ? 7 : 1))) buckets.set(dayKey(d), {});
+  const keys = [...buckets.keys()];
+  for (const s of ses) {
+    const d = new Date(s.st); let k = dayKey(d);
+    if (weekly) { const i = Math.min(keys.length - 1, Math.floor((d - start) / (7 * 864e5))); k = keys[Math.max(0, i)]; }
+    const b = buckets.get(k); if (!b) continue;
+    for (const [m, c] of Object.entries(s.mc)) b[family(m)] = (b[family(m)] || 0) + c;
+  }
+  const totals = keys.map(k => Object.values(buckets.get(k)).reduce((a, v) => a + v, 0));
+  const max = Math.max(1e-9, ...totals);
+  const fams = ["opus", "sonnet", "haiku", "fable", "other"];
+  $("spend").innerHTML = keys.map((k, i) => {
+    const b = buckets.get(k);
+    return '<div class=scol title="' + (weekly ? "week of " : "") + k + ": " + usd(totals[i]) + '">' + fams.filter(f => b[f]).map(f =>
+      '<div class=seg-bar style="height:' + (b[f] / max * 100).toFixed(2) + '%;background:var(--' + f + ')"></div>').join("") + '</div>';
+  }).join("");
+  $("spend-x").innerHTML = keys.length ? '<span>' + keys[0].slice(5) + '</span><span>' + keys[keys.length - 1].slice(5) + '</span>' : "";
+  $("spend-note").textContent = (weekly ? "per week" : "per day") + (!period && Object.keys(legacy).length ? " · machines without a session list are not charted" : "");
+  const usedFams = fams.filter(f => keys.some(k => buckets.get(k)[f]));
+  $("legend").innerHTML = usedFams.map(f => '<span><i class=sw style="background:var(--' + f + ')"></i>' + f + '</span>').join("");
+
+  const hbars = (obj, colorFn) => {
+    const rows = Object.entries(obj).filter(([, v]) => v > 0.005).sort((a, b) => b[1] - a[1]);
+    if (!rows.length) return '<div class=empty>Nothing in this period</div>';
+    const tot = rows.reduce((a, r) => a + r[1], 0);
+    return rows.map(([k, v]) => '<div class=hb><div class=hb-top><span>' + esc(k) + '</span><span>' + usd(v) + ' · ' + Math.round(v / tot * 100) + '%</span></div><div class=track><div class=fill style="width:' + (v / rows[0][1] * 100).toFixed(1) + '%;background:' + colorFn(k) + '"></div></div></div>').join("");
+  };
+  $("machines").innerHTML = hbars(byMachine, () => "var(--accent)");
+  $("models").innerHTML = hbars(byModel, color);
+
+  // top sessions
+  const q = $("q").value.trim().toLowerCase(), src = $("src").value, sort = $("sort").value;
+  let list = ses.filter(s => (!src || s.s === src) && (!q || (s.t + " " + s.f).toLowerCase().includes(q)));
+  list.sort((a, b) => sort === "st" ? (a.st < b.st ? 1 : -1) : b[sort] - a[sort]);
+  $("ses-note").textContent = list.length.toLocaleString() + " sessions · " + label;
+  $("rows").innerHTML = list.slice(0, shown).map(s => {
+    const main = Object.entries(s.mc).sort((a, b) => b[1] - a[1])[0]?.[0] || "";
+    const d = new Date(s.st);
+    return '<tr><td class=muted>' + d.toLocaleDateString("en-US", { month: "short", day: "numeric" }) + '<br>' + d.toLocaleTimeString("en-US", { hour: "numeric", minute: "2-digit" }) + '</td>' +
+      '<td class=title><div>' + (s.t ? esc(s.t) : '<span class=muted>(no prompt text)</span>') + '</div><div class=muted>' + esc(s.f || "") + '</div></td>' +
+      '<td><span class=pill>' + esc(s.s) + '</span></td><td class=num>' + dur(s.st, s.en) + '</td><td class=num>' + s.m.toLocaleString() + '</td>' +
+      '<td>' + (main ? '<i class=sw style="background:' + color(main) + '"></i>' + esc(main) : "") + '</td><td class=num><b>' + usd(s.c) + '</b></td></tr>';
+  }).join("") || '<tr><td colspan=7 class=empty>No sessions match</td></tr>';
+  $("more").hidden = list.length <= shown;
+}
+
+$("period").addEventListener("click", e => {
+  const b = e.target.closest("button"); if (!b) return;
+  period = +b.dataset.d; shown = 25;
+  try { localStorage.setItem("period", period); } catch {}
+  draw();
+});
+for (const id of ["q", "src", "sort"]) $(id).addEventListener("input", () => { shown = 25; draw(); });
+$("more").addEventListener("click", () => { shown += 25; draw(); });
+draw();
+</script>`;
 }

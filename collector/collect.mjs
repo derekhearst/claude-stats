@@ -16,7 +16,8 @@
  * Works under bun or Node 18+ (uses global fetch; no dependencies).
  */
 
-import { readFileSync, readdirSync, statSync, existsSync } from "node:fs";
+import { readFileSync, readdirSync, statSync, existsSync, writeFileSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -26,6 +27,20 @@ const HERE = dirname(fileURLToPath(import.meta.url));
 // ---- args + config ------------------------------------------------------
 const argv = process.argv.slice(2);
 const getArg = (k) => { const i = argv.indexOf(k); return i >= 0 ? argv[i + 1] : undefined; };
+
+// A downloaded copy (work PC, devbox) updates itself: fetch the latest collector and, if it changed,
+// save it and run that instead. A git checkout skips this; so does --no-update.
+const SELF_URL = "https://raw.githubusercontent.com/derekhearst/claude-stats/main/collector/collect.mjs";
+if (!argv.includes("--no-update") && !existsSync(join(HERE, "..", ".git"))) {
+  try {
+    const me = fileURLToPath(import.meta.url);
+    const latest = await (await fetch(SELF_URL)).text();
+    if (latest.startsWith("#!/usr/bin/env bun") && latest !== readFileSync(me, "utf8")) {
+      writeFileSync(me, latest);
+      process.exit(spawnSync(process.execPath, [me, ...argv, "--no-update"], { stdio: "inherit" }).status ?? 1);
+    }
+  } catch { /* offline: run this copy */ }
+}
 
 let cfg = {};
 const cfgPath = join(HERE, "collector.config.json");
@@ -87,6 +102,7 @@ function fromTranscripts(dir, source) {
   const hourly = {};           // hour(0-23) -> count
   const tools = {};            // tool name -> count
   const projUsage = {};        // project -> model -> {input,output,cacheRead,cacheCreate}
+  const sessions = {};         // sid -> {start,end,title,folder,messages,toolCalls,usage:{model:[in,out,cacheRead,cacheCreate]}}
   let firstSession = null;
 
   const projects = existsSync(projectsDir)
@@ -109,12 +125,20 @@ function fromTranscripts(dir, source) {
         (daily[date] ??= { messages: 0, sessions: 0, tool_calls: 0 }).messages++;
         hourly[new Date(ts).getHours()] = (hourly[new Date(ts).getHours()] || 0) + 1;
         if (sid && !(sid in sessionStart)) sessionStart[sid] = date;
+        const ses = sid ? (sessions[sid] ??= { start: ts, end: ts, title: "", folder: "", messages: 0, toolCalls: 0, usage: {} }) : null;
+        if (ses) {
+          ses.messages++;
+          if (ts < ses.start) ses.start = ts;
+          if (ts > ses.end) ses.end = ts;
+          if (!ses.folder && d.cwd) ses.folder = String(d.cwd).split(/[\\/]/).filter(Boolean).pop() || String(d.cwd);
+          if (!ses.title && d.type === "user" && !d.isSidechain && !d.isMeta) ses.title = promptTitle(d.message?.content);
+        }
         if (!firstSession || ts < firstSession) firstSession = ts;
 
         if (d.type === "assistant") {
           const msg = d.message || {};
           const model = msg.model, u = msg.usage;
-          if (model && u) {
+          if (model && u && model !== "<synthetic>") {
             const io = (u.input_tokens || 0) + (u.output_tokens || 0);
             (dmt[date] ??= {});
             dmt[date][model] = (dmt[date][model] || 0) + io;
@@ -126,12 +150,18 @@ function fromTranscripts(dir, source) {
             };
             add(usage[model] ??= { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 });
             add((projUsage[project] ??= {})[model] ??= { input: 0, output: 0, cacheRead: 0, cacheCreate: 0 });
+            if (ses) {
+              const su = (ses.usage[model] ??= [0, 0, 0, 0]);
+              su[0] += u.input_tokens || 0; su[1] += u.output_tokens || 0;
+              su[2] += u.cache_read_input_tokens || 0; su[3] += u.cache_creation_input_tokens || 0;
+            }
           }
           const c = msg.content;
           if (Array.isArray(c))
             for (const b of c)
               if (b && b.type === "tool_use") {
                 daily[date].tool_calls++;
+                if (ses) ses.toolCalls++;
                 tools[b.name || "?"] = (tools[b.name || "?"] || 0) + 1;
               }
         }
@@ -150,7 +180,18 @@ function fromTranscripts(dir, source) {
     tools: Object.entries(tools).map(([tool, count]) => ({ tool, count })),
     projectUsage: Object.entries(projUsage).flatMap(([project, mm]) =>
       Object.entries(mm).map(([model, u]) => ({ project, model, ...u }))),
+    sessions: Object.entries(sessions).filter(([, v]) => Object.keys(v.usage).length).map(([id, v]) => ({ id, ...v })),
   };
+}
+
+// A session's label: the opening of its first real prompt (not a slash command, hook output or
+// system text), whitespace collapsed, at most 100 characters.
+function promptTitle(content) {
+  const text = typeof content === "string" ? content
+    : Array.isArray(content) ? content.filter(b => b && b.type === "text").map(b => b.text).join(" ") : "";
+  const t = text.replace(/\s+/g, " ").trim();
+  if (!t || /^(<|Caveat:|\[Request interrupted|This session is being continued)/.test(t)) return "";
+  return t.length > 100 ? t.slice(0, 99) + "…" : t;
 }
 
 function fromWebExport(path, source) {
