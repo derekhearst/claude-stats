@@ -103,6 +103,7 @@ function fromTranscripts(dir, source) {
   const tools = {};            // tool name -> count
   const projUsage = {};        // project -> model -> {input,output,cacheRead,cacheCreate}
   const sessions = {};         // sid -> {start,end,title,folder,messages,toolCalls,usage:{model:[in,out,cacheRead,cacheCreate]}}
+  const named = {};            // sid -> {custom, ai}: the names Claude Code gives a session
   let firstSession = null;
 
   const projects = existsSync(projectsDir)
@@ -116,6 +117,8 @@ function fromTranscripts(dir, source) {
       for (const line of lines) {
         const t = line.trim(); if (!t) continue;
         let d; try { d = JSON.parse(t); } catch { continue; }
+        if (d.type === "custom-title" && d.sessionId && d.customTitle) { (named[d.sessionId] ??= {}).custom = String(d.customTitle); continue; }
+        if (d.type === "ai-title" && d.sessionId && d.aiTitle) { (named[d.sessionId] ??= {}).ai = String(d.aiTitle); continue; }
         if (d.type !== "user" && d.type !== "assistant") continue;
         if (remoteCwdOwnedElsewhere && project.startsWith("ssh-") && String(d.cwd || "").startsWith(remoteCwdOwnedElsewhere)) continue;
         const ts = d.timestamp; if (!ts) continue;
@@ -180,8 +183,34 @@ function fromTranscripts(dir, source) {
     tools: Object.entries(tools).map(([tool, count]) => ({ tool, count })),
     projectUsage: Object.entries(projUsage).flatMap(([project, mm]) =>
       Object.entries(mm).map(([model, u]) => ({ project, model, ...u }))),
-    sessions: Object.entries(sessions).filter(([, v]) => Object.keys(v.usage).length).map(([id, v]) => ({ id, ...v })),
+    // title: the session's own name (as renamed, else as auto-named), then Claude Desktop's, then the first prompt
+    sessions: (() => {
+      const desktop = desktopTitles();
+      return Object.entries(sessions).filter(([, v]) => Object.keys(v.usage).length).map(([id, v]) =>
+        ({ id, ...v, title: named[id]?.custom || named[id]?.ai || desktop[id] || v.title }));
+    })(),
   };
+}
+
+// Claude Desktop keeps a record per session (claude-code-sessions/**/local_*.json) holding its sidebar
+// title and the Claude Code session id. Read from every Desktop profile folder there is: %APPDATA%\Claude*
+// and, for the Store (MSIX) install, %LOCALAPPDATA%\Packages\Claude*\LocalCache\Roaming\Claude*.
+function desktopTitles() {
+  const out = {};
+  const visit = (dir, depth) => {
+    let names; try { names = readdirSync(dir); } catch { return; }
+    for (const n of names) {
+      const p = join(dir, n);
+      if (n.startsWith("local_") && n.endsWith(".json")) {
+        try { const j = JSON.parse(readFileSync(p, "utf8")); if (j.cliSessionId && j.title) out[j.cliSessionId] = String(j.title); } catch {}
+      } else if (depth < 4) { try { if (statSync(p).isDirectory()) visit(p, depth + 1); } catch {} }
+    }
+  };
+  const profiles = (base) => { try { return readdirSync(base).filter(n => /^Claude/.test(n)).map(n => join(base, n)); } catch { return []; } };
+  const dirs = profiles(process.env.APPDATA || "");
+  for (const pkg of profiles(join(process.env.LOCALAPPDATA || "", "Packages"))) dirs.push(...profiles(join(pkg, "LocalCache", "Roaming")));
+  for (const d of dirs) visit(join(d, "claude-code-sessions"), 0);
+  return out;
 }
 
 // A session's label: the opening of its first real prompt (not a slash command, hook output or
