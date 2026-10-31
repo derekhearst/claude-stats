@@ -5,16 +5,33 @@ surfaces — built on Cloudflare Workers + D1.
 
 ```
 home PC  ──┐
-work PC  ──┼─ (scheduled) ──POST /ingest──▶  Worker ──▶ D1
+work PC  ──┤
+devbox   ──┼─ (scheduled) ──POST /ingest──▶  Worker ──▶ D1
+agent-runner (hourly, from its dispatcher)     │
 web export ┘ (manual)                          │
                                   any browser ◀─┘  GET / (password-gated dashboard)
 ```
 
 - **Claude Code (per machine):** fully automatic via a scheduled collector that parses
-  local transcripts under `~/.claude/projects`.
+  local transcripts under `~/.claude/projects`. A downloaded copy of the collector updates
+  itself from this repo on each run; a git checkout does not.
+- **agent-runner / devbox:** the TrueNAS agent runner reports its issue runs, and its dev box
+  runs the collector over its own history (see the agent-runner README).
 - **claude.ai web:** semi-manual — request a data export and run the collector on it.
 - **Tokens + estimated cost:** included for Claude Code; web is activity-only (the
   consumer export carries no token counts).
+
+## The dashboard
+
+- A **7d / 30d / 90d / All** switch drives the cost cards, the spend chart (per day, stacked
+  by model family), cost by machine and by model, and **Top sessions**.
+- **Top sessions** lists each session with the opening of its first prompt as its title,
+  the folder, machine, length, messages, main model and cost. Search and sort it in place.
+- Below: activity heatmap, time of day, weekday and top tools (all time).
+- Prices come live from LiteLLM's public price list (cached daily), with a built-in table
+  as fallback. A session's cost counts on the day it started.
+- A machine whose collector has not yet sent a session list shows as "totals only" and
+  counts only in **All**.
 
 ## Components
 
@@ -80,6 +97,6 @@ Works under `bun` or Node 18+ (no dependencies).
 - **Idempotent:** each run replaces that source's data wholesale — re-running never
   double-counts. The collector reads full local history each time.
 - **Cost is hypothetical** — subscriptions are billed flat; the figure is what the same
-  tokens would cost at API list price (cache-write = 1.25× input, cache-read = 0.1×).
+  tokens would cost at API list price, cache reads and writes at each model's own rates.
 - **Keep history forever:** set `cleanupPeriodDays` high in `~/.claude/settings.json` so
   Claude Code stops auto-deleting transcripts after 30 days.
