@@ -218,7 +218,9 @@ function desktopTitles() {
 function promptTitle(content) {
   const text = typeof content === "string" ? content
     : Array.isArray(content) ? content.filter(b => b && b.type === "text").map(b => b.text).join(" ") : "";
-  const t = text.replace(/\s+/g, " ").trim();
+  // A project thread opens with the coordinator's <relay>…<note>task</note> or a <wake>…<message>: use that text.
+  const inner = /^\s*<(relay|wake)\b/.test(text) ? /<(note|message)\b[^>]*>([\s\S]*?)<\/\1>/.exec(text)?.[2] : null;
+  const t = (inner ?? text).replace(/\s+/g, " ").trim();
   if (!t || /^(<|Caveat:|\[Request interrupted|This session is being continued)/.test(t)) return "";
   return t.length > 100 ? t.slice(0, 99) + "…" : t;
 }
