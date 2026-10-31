@@ -36,6 +36,9 @@ const source = getArg("--source") || (webPath ? "web" : cfg.source);
 const url = (getArg("--url") || cfg.url || "").replace(/\/+$/, "");
 const token = getArg("--token") || cfg.token;
 const claudeDir = getArg("--claude-dir") || cfg.claudeDir || join(homedir(), ".claude");
+// Desktop keeps a local copy of SSH sessions (projects/ssh-<id>). Ones that ran on the agent-runner
+// devbox are also in the devbox's own transcripts, which its collector reports, so skip them here.
+const remoteCwdOwnedElsewhere = cfg.skipSshCwd ?? "/home/agent";
 
 if (!source || !url || !token) {
   console.error("Need source, url, and token (via collector.config.json or flags). See header.");
@@ -98,6 +101,7 @@ function fromTranscripts(dir, source) {
         const t = line.trim(); if (!t) continue;
         let d; try { d = JSON.parse(t); } catch { continue; }
         if (d.type !== "user" && d.type !== "assistant") continue;
+        if (remoteCwdOwnedElsewhere && project.startsWith("ssh-") && String(d.cwd || "").startsWith(remoteCwdOwnedElsewhere)) continue;
         const ts = d.timestamp; if (!ts) continue;
         const date = localDate(ts);
         const sid = d.sessionId;

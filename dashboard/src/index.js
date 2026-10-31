@@ -92,6 +92,9 @@ export default {
 };
 
 // ---- ingest -------------------------------------------------------------
+// Whole numbers without `| 0`: that wraps at 2^31, and cache-read totals pass 2 billion.
+const int = (v) => Math.trunc(Number(v) || 0);
+
 async function ingest(request, env) {
   const auth = request.headers.get("authorization") || "";
   const token = auth.replace(/^Bearer\s+/i, "");
@@ -115,35 +118,35 @@ async function ingest(request, env) {
   for (const r of daily)
     stmts.push(env.DB.prepare(
       "INSERT INTO daily (source,date,messages,sessions,tool_calls) VALUES (?,?,?,?,?)"
-    ).bind(source, r.date, r.messages | 0, r.sessions | 0, r.tool_calls | 0));
+    ).bind(source, r.date, int(r.messages), int(r.sessions), int(r.tool_calls)));
   for (const r of dmt)
     stmts.push(env.DB.prepare(
       "INSERT INTO daily_model_tokens (source,date,model,tokens) VALUES (?,?,?,?)"
-    ).bind(source, r.date, r.model, r.tokens | 0));
+    ).bind(source, r.date, r.model, int(r.tokens)));
   for (const r of mu)
     stmts.push(env.DB.prepare(
       "INSERT INTO model_usage (source,model,input_tokens,output_tokens,cache_read,cache_create) VALUES (?,?,?,?,?,?)"
-    ).bind(source, r.model, r.input | 0, r.output | 0, r.cacheRead | 0, r.cacheCreate | 0));
+    ).bind(source, r.model, int(r.input), int(r.output), int(r.cacheRead), int(r.cacheCreate)));
   // New tables — only touch them if the payload includes the array, so an older
   // collector (no hourly/tools/projectUsage) doesn't wipe a source's data.
   if (Array.isArray(body.hourly)) {
     stmts.push(env.DB.prepare("DELETE FROM hourly WHERE source=?").bind(source));
     for (const r of body.hourly)
       stmts.push(env.DB.prepare("INSERT INTO hourly (source,hour,count) VALUES (?,?,?)")
-        .bind(source, r.hour | 0, r.count | 0));
+        .bind(source, int(r.hour), int(r.count)));
   }
   if (Array.isArray(body.tools)) {
     stmts.push(env.DB.prepare("DELETE FROM tools WHERE source=?").bind(source));
     for (const r of body.tools)
       stmts.push(env.DB.prepare("INSERT INTO tools (source,tool,count) VALUES (?,?,?)")
-        .bind(source, String(r.tool), r.count | 0));
+        .bind(source, String(r.tool), int(r.count)));
   }
   if (Array.isArray(body.projectUsage)) {
     stmts.push(env.DB.prepare("DELETE FROM project_usage WHERE source=?").bind(source));
     for (const r of body.projectUsage)
       stmts.push(env.DB.prepare(
         "INSERT INTO project_usage (source,project,model,input_tokens,output_tokens,cache_read,cache_create) VALUES (?,?,?,?,?,?,?)"
-      ).bind(source, String(r.project), String(r.model), r.input | 0, r.output | 0, r.cacheRead | 0, r.cacheCreate | 0));
+      ).bind(source, String(r.project), String(r.model), int(r.input), int(r.output), int(r.cacheRead), int(r.cacheCreate)));
   }
 
   stmts.push(env.DB.prepare(
