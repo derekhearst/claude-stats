@@ -261,6 +261,8 @@ function render(daily, dmt, mu, meta, hourly = [], toolRows = [], sessionSets = 
     const c = tokenCost(p, r); l.cost += c; l.mc[short(r.model)] = (l.mc[short(r.model)] || 0) + c;
   }
   const dayRows = daily.map(r => [r.date, r.source, r.messages, r.sessions]);
+  // input + output tokens per day, machine and model: every machine sends these, with or without a session list
+  const tokRows = dmt.filter(r => !/(est.)/.test(r.model) && r.tokens > 0).map(r => [r.date, r.source, r.model, r.tokens]);
   const sources = meta.map(m => ({ s: m.source, at: m.last_push, sessions: withSessions.has(m.source) }))
     .sort((a, b) => a.s < b.s ? -1 : 1);
 
@@ -320,7 +322,7 @@ function render(daily, dmt, mu, meta, hourly = [], toolRows = [], sessionSets = 
 
   // JSON for the page script; < escaped so no string can close the script tag
   const firstCode = meta.filter(m => m.source !== "web" && m.first_session).map(m => m.first_session).sort()[0] || null;
-  const data = JSON.stringify({ sessions, legacy, dayRows, sources, firstCode }).replace(/</g, "\\u003c");
+  const data = JSON.stringify({ sessions, legacy, dayRows, tokRows, sources, firstCode }).replace(/</g, "\\u003c");
 
   return `<!doctype html><html lang=en><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
@@ -405,7 +407,7 @@ function render(daily, dmt, mu, meta, hourly = [], toolRows = [], sessionSets = 
 <div class=cards id=cards></div>
 
 <div class="grid g-main">
- <div class=panel><h2>Spend <span id=spend-note></span></h2><div class=spend id=spend></div><div class=xlab id=spend-x></div><div class=legend id=legend></div></div>
+ <div class=panel><h2>Tokens <span id=spend-note></span></h2><div class=spend id=spend></div><div class=xlab id=spend-x></div><div class=legend id=legend></div></div>
  <div class=panel><h2>By machine</h2><div id=machines></div><h2 style=margin-top:20px>By model</h2><div id=models></div></div>
 </div>
 
@@ -471,14 +473,16 @@ function draw() {
 
   let cost = 0, tok = 0, sesCost = 0; const byMachine = {}, byModel = {};
   for (const s of ses) {
-    cost += s.c; sesCost += s.c; tok += s.tok;
+    cost += s.c; sesCost += s.c;
     byMachine[s.s] = (byMachine[s.s] || 0) + s.c;
     for (const [m, c] of Object.entries(s.mc)) byModel[m] = (byModel[m] || 0) + c;
   }
   for (const [src, l] of Object.entries(legacy)) {
-    cost += l.cost; tok += l.tok; byMachine[src] = (byMachine[src] || 0) + l.cost;
+    cost += l.cost; byMachine[src] = (byMachine[src] || 0) + l.cost;
     for (const [m, c] of Object.entries(l.mc)) byModel[m] = (byModel[m] || 0) + c;
   }
+  const toks = D.tokRows.filter(r => inPeriod(r[0]));
+  for (const r of toks) tok += r[3];
   const sessionsN = days.reduce((a, r) => a + r[3], 0);
   const activeDays = new Set(days.map(r => r[0])).size;
   let spanDays = period;
@@ -493,27 +497,27 @@ function draw() {
     card("Active days", activeDays + (period ? " / " + period : ""), "") +
     card("Tokens", tokf(tok), "input + output");
 
-  // spend chart: daily bars (weekly when the range is long), stacked by model family
+  // token chart: daily bars (weekly when the range is long), stacked by model family
   const buckets = new Map(); const weekly = spanDays > 120;
   const start = new Date(); start.setHours(0,0,0,0); start.setDate(start.getDate() - spanDays + 1);
   for (let d = new Date(start); d <= new Date(); d.setDate(d.getDate() + (weekly ? 7 : 1))) buckets.set(dayKey(d), {});
   const keys = [...buckets.keys()];
-  for (const s of ses) {
-    const d = new Date(s.st); let k = dayKey(d);
-    if (weekly) { const i = Math.min(keys.length - 1, Math.floor((d - start) / (7 * 864e5))); k = keys[Math.max(0, i)]; }
+  for (const [date, , model, n] of toks) {
+    let k = date;
+    if (weekly) { const i = Math.floor((new Date(date + "T00:00:00") - start) / (7 * 864e5)); k = keys[Math.min(keys.length - 1, Math.max(0, i))]; }
     const b = buckets.get(k); if (!b) continue;
-    for (const [m, c] of Object.entries(s.mc)) b[family(m)] = (b[family(m)] || 0) + c;
+    b[family(model)] = (b[family(model)] || 0) + n;
   }
   const totals = keys.map(k => Object.values(buckets.get(k)).reduce((a, v) => a + v, 0));
   const max = Math.max(1e-9, ...totals);
   const fams = ["opus", "sonnet", "haiku", "fable", "other"];
   $("spend").innerHTML = keys.map((k, i) => {
     const b = buckets.get(k);
-    return '<div class=scol title="' + (weekly ? "week of " : "") + k + ": " + usd(totals[i]) + '">' + fams.filter(f => b[f]).map(f =>
+    return '<div class=scol title="' + (weekly ? "week of " : "") + k + ": " + tokf(totals[i]) + " tokens" + '">' + fams.filter(f => b[f]).map(f =>
       '<div class=seg-bar style="height:' + (b[f] / max * 100).toFixed(2) + '%;background:var(--' + f + ')"></div>').join("") + '</div>';
   }).join("");
   $("spend-x").innerHTML = keys.length ? '<span>' + keys[0].slice(5) + '</span><span>' + keys[keys.length - 1].slice(5) + '</span>' : "";
-  $("spend-note").textContent = (weekly ? "per week" : "per day") + (!period && Object.keys(legacy).length ? " · machines without a session list are not charted" : "");
+  $("spend-note").textContent = "input + output, " + (weekly ? "per week" : "per day") + " · peak " + tokf(Math.max(0, ...totals));
   const usedFams = fams.filter(f => keys.some(k => buckets.get(k)[f]));
   $("legend").innerHTML = usedFams.map(f => '<span><i class=sw style="background:var(--' + f + ')"></i>' + f + '</span>').join("");
 

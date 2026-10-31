@@ -23,7 +23,7 @@ web export ┘ (manual)                          │
 
 ## The dashboard
 
-- A **7d / 30d / 90d / All** switch drives the cost cards, the spend chart (per day, stacked
+- A **7d / 30d / 90d / All** switch drives the cost cards, the token chart (input + output per day, stacked
   by model family), cost by machine and by model, and **Top sessions**.
 - **Top sessions** lists each session with the opening of its first prompt as its title,
   the folder, machine, length, messages, main model and cost. Search and sort it in place.
