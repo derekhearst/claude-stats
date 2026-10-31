@@ -25,7 +25,8 @@ web export ┘ (manual)                          │
 
 - A **7d / 30d / 90d / All** switch drives the cost cards, the token chart (input + output per day, stacked
   by model family), cost by machine and by model, and **Top sessions**.
-- **Top sessions** lists each session with the opening of its first prompt as its title,
+- **Top sessions** lists each session by its title (the name Claude Code or Desktop gave it,
+  else the opening of its first prompt),
   the folder, machine, length, messages, main model and cost. Search and sort it in place.
 - Below: activity heatmap, time of day, weekday and top tools (all time).
 - Prices come live from LiteLLM's public price list (cached daily), with a built-in table
