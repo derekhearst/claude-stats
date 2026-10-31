@@ -70,8 +70,9 @@ const res = await fetch(url + "/ingest", {
   body: JSON.stringify(payload),
 });
 const text = await res.text();
-if (!res.ok) { console.error(`Ingest failed (${res.status}): ${text}`); process.exit(1); }
-console.log(`Pushed ${source}: ${payload.daily.length} days, ${payload.modelUsage.length} models → ${text}`);
+const stamp = new Date().toISOString();
+if (!res.ok) { console.error(`${stamp} Ingest failed (${res.status}): ${text}`); process.exit(1); }
+console.log(`${stamp} Pushed ${source}: ${payload.daily.length} days, ${payload.modelUsage.length} models → ${text}`);
 
 // ---- parsers ------------------------------------------------------------
 function fromTranscripts(dir, source) {

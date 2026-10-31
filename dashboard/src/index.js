@@ -12,18 +12,61 @@
  * Storage: D1 (binding `DB`). Tables: daily, daily_model_tokens, model_usage, meta.
  */
 
-const PRICE = {
-  "claude-opus-4-8":          { in: 5,  out: 25 },
-  "claude-opus-4-7":          { in: 5,  out: 25 },
-  "claude-opus-4-6":          { in: 5,  out: 25 },
-  "claude-opus-4-5":          { in: 5,  out: 25 },
-  "claude-sonnet-4-6":        { in: 3,  out: 15 },
-  "claude-sonnet-4-5":        { in: 3,  out: 15 },
-  "claude-haiku-4-5":         { in: 1,  out: 5  },
-  "claude-haiku-4-5-20251001":{ in: 1,  out: 5  },
-  "claude-fable-5":           { in: 10, out: 50 },
-  "claude-mythos-5":          { in: 10, out: 50 },
+// $/MTok at API list price. Live prices come from LiteLLM's public price list
+// (refreshed daily via the Cloudflare cache), so new models price themselves on
+// release. This table is the fallback when that fetch fails. Fields: in, out,
+// cr = cache read, cw = cache write (default 0.1x / 1.25x input).
+const FALLBACK_PRICE = {
+  "claude-fable-5-1":  { in: 10,  out: 50,  cr: 0.25 },
+  "claude-fable-5":    { in: 10,  out: 50 },
+  "claude-mythos-5":   { in: 10,  out: 50 },
+  "claude-opus-5-5":   { in: 4,   out: 20,  cr: 0.20 },
+  "claude-opus-5":     { in: 5,   out: 25 },
+  "claude-opus-4-8":   { in: 5,   out: 25 },
+  "claude-opus-4-7":   { in: 5,   out: 25 },
+  "claude-opus-4-6":   { in: 5,   out: 25 },
+  "claude-opus-4-5":   { in: 5,   out: 25 },
+  "claude-sonnet-5-5": { in: 2,   out: 10,  cr: 0.20 },
+  "claude-sonnet-5":   { in: 2,   out: 10 },
+  "claude-sonnet-4-6": { in: 3,   out: 15 },
+  "claude-sonnet-4-5": { in: 3,   out: 15 },
+  "claude-haiku-5-5":  { in: 0.1, out: 0.5 },
+  "claude-haiku-4-5":  { in: 1,   out: 5 },
 };
+const PRICE_URL = "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json";
+let PRICE = FALLBACK_PRICE;
+let priceSource = "built-in table";
+
+async function loadPrices() {
+  try {
+    const res = await fetch(PRICE_URL, { cf: { cacheTtl: 86400, cacheEverything: true } });
+    if (!res.ok) throw new Error(res.status);
+    const all = await res.json();
+    const live = {};
+    for (const [k, v] of Object.entries(all)) {
+      if (!k.startsWith("claude-") || v.litellm_provider !== "anthropic" || !v.input_cost_per_token) continue;
+      live[k] = {
+        in: v.input_cost_per_token * 1e6,
+        out: v.output_cost_per_token * 1e6,
+        cr: v.cache_read_input_token_cost != null ? v.cache_read_input_token_cost * 1e6 : undefined,
+        cw: v.cache_creation_input_token_cost != null ? v.cache_creation_input_token_cost * 1e6 : undefined,
+      };
+    }
+    PRICE = { ...FALLBACK_PRICE, ...live };
+    priceSource = "LiteLLM price list";
+  } catch {
+    PRICE = FALLBACK_PRICE;
+    priceSource = "built-in table (live prices unavailable)";
+  }
+}
+
+// exact id first, then without a -YYYYMMDD snapshot suffix
+const priceFor = (model) => PRICE[model] || PRICE[String(model).replace(/-\d{8}$/, "")];
+const cacheReadPrice = (p) => p.cr ?? p.in * 0.1;
+const tokenCost = (p, r) => r.input_tokens / 1e6 * p.in
+  + r.output_tokens / 1e6 * p.out
+  + r.cache_create / 1e6 * (p.cw ?? p.in * 1.25)
+  + r.cache_read / 1e6 * cacheReadPrice(p);
 
 export default {
   async fetch(request, env) {
@@ -161,6 +204,7 @@ async function dashboard(request, env, url) {
     env.DB.prepare("SELECT * FROM project_usage").all(),
   ]);
 
+  await loadPrices();
   return new Response(render(daily.results, dmt.results, mu.results, meta.results,
     hourly.results, tools.results, proj.results), { headers });
 }
@@ -194,17 +238,15 @@ function render(daily, dmt, mu, meta, hourly = [], toolRows = [], projRows = [])
 
   // cost + cache totals from model_usage
   let cost = 0, costRows = [], totalCacheRead = 0, cacheSavings = 0;
+  const unpriced = new Set();
   for (const r of mu) {
     totalCacheRead += r.cache_read || 0;
-    const p = PRICE[r.model]; if (!p) continue;
-    const c = r.input_tokens / 1e6 * p.in
-            + r.output_tokens / 1e6 * p.out
-            + r.cache_create / 1e6 * p.in * 1.25
-            + r.cache_read / 1e6 * p.in * 0.1;
+    const p = priceFor(r.model); if (!p) { unpriced.add(r.model); continue; }
+    const c = tokenCost(p, r);
     cost += c;
     costRows.push([r.source, r.model, c]);
-    // what cache reads saved vs paying full input price (0.1x → 1x)
-    cacheSavings += (r.cache_read || 0) / 1e6 * p.in * 0.9;
+    // what cache reads saved vs paying full input price
+    cacheSavings += (r.cache_read || 0) / 1e6 * (p.in - cacheReadPrice(p));
   }
   costRows.sort((a, b) => b[2] - a[2]);
 
@@ -258,11 +300,10 @@ function render(daily, dmt, mu, meta, hourly = [], toolRows = [], projRows = [])
   // per-project tokens + cost
   const projAgg = {};
   for (const r of projRows) {
-    const p = PRICE[r.model];
+    const p = priceFor(r.model);
     const a = (projAgg[r.project] ??= { tokens: 0, cost: 0 });
     a.tokens += (r.input_tokens || 0) + (r.output_tokens || 0);
-    if (p) a.cost += r.input_tokens / 1e6 * p.in + r.output_tokens / 1e6 * p.out
-                   + r.cache_create / 1e6 * p.in * 1.25 + r.cache_read / 1e6 * p.in * 0.1;
+    if (p) a.cost += tokenCost(p, r);
   }
   const projList = Object.entries(projAgg).sort((a, b) => b[1].cost - a[1].cost);
 
@@ -435,6 +476,6 @@ function render(daily, dmt, mu, meta, hourly = [], toolRows = [], projRows = [])
   <tr><td colspan=2><b>Total</b></td><td class=num><b>${usd(cost)}</b></td></tr></table></div>
 </div>
 
-<p class=foot>Cost is hypothetical — subscription usage is billed flat; this is what the same tokens would cost at API list price (cache-write 1.25× input, cache-read 0.1× input). Web tokens (*) are a rough ~chars/4 estimate — the export has no real counts — and are excluded from Total tokens and cost. Run rate = total cost ÷ Code day-span × 30.</p>
+<p class=foot>Cost is hypothetical — subscription usage is billed flat; this is what the same tokens would cost at API list price (prices from the ${priceSource}, cache reads and writes at each model's own rates).${unpriced.size ? ` No price yet for ${[...unpriced].join(", ")}; those tokens are left out of cost.` : ""} Web tokens (*) are a rough ~chars/4 estimate — the export has no real counts — and are excluded from Total tokens and cost. Run rate = total cost ÷ Code day-span × 30.</p>
 </div>`;
 }
